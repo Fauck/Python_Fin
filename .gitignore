@@ -1,2 +1,5 @@
 .DB_Store
 Fauck_env
+.env
+__pycache__/
+*.pyc
