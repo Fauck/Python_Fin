@@ -26,7 +26,7 @@ Python_Fin/
 
 ## app.py 架構
 
-### 設計原則：資料層與 UI 層完全解耦
+### 設計原則：資料層、演算法層、UI 層三層解耦
 
 ```
 app.py
@@ -39,19 +39,58 @@ app.py
 │         透過 Historical API 取得 K 線資料
 │         回傳已整理好的 pandas DataFrame
 │
+├── 演算法層（純邏輯，不含任何 Streamlit 元素）
+│   ├── check_consolidation_breakout(df, consolidation_days, amplitude_threshold,
+│   │     volume_ratio, check_volume)        → 盤整突破第一根
+│   ├── check_bullish_ma_alignment(df)       → 均線多頭排列（5/10/20MA）
+│   ├── check_volume_surge_bullish(df, volume_ratio, body_pct) → 爆量長紅起漲
+│   ├── check_oversold_reversal(df, bias_threshold, shadow_ratio) → 乖離過大跌深反彈
+│   │     ↑ 所有策略函式共享相同簽名：輸入 DataFrame，輸出 dict 或 None
+│   │
+│   └── scan_watchlist(symbols, strategy_fn, fetch_limit, sleep_sec, ...)
+│         通用批次掃描引擎，接受任意策略函式
+│         每次呼叫間加入 time.sleep 避免觸發 Rate Limit
+│         回傳 (results, errors) tuple
+│
 └── UI 層（純渲染，不含業務邏輯）
-    ├── render_data_table(df, symbol)
-    │     以 DataFrame 表格顯示歷史價格資料
-    │
-    ├── render_close_chart(df, symbol)
-    │     繪製收盤價折線走勢圖（Plotly Scatter）
-    │
-    ├── render_candlestick_chart(df, symbol)
-    │     繪製 K 線圖（Plotly Candlestick）
-    │
-    └── main()
-          Streamlit 進入點，負責 Sidebar 參數收集與流程控制
+    ├── render_data_table(df, symbol)        DataFrame 表格
+    ├── render_close_chart(df, symbol)       收盤價折線圖（Plotly Scatter）
+    ├── render_candlestick_chart(df, symbol) K 線圖（Plotly Candlestick）
+    ├── render_single_stock_page()           單股分析頁面
+    ├── render_screener_page()               盤整突破選股頁面
+    └── main()                              st.tabs 導覽 + 頁面路由
 ```
+
+### 頁面導覽
+
+使用 `st.tabs` 分為兩個頁面，各頁使用 `st.columns([1, 3])` 模擬左欄控制面板：
+
+| Tab | 頁面 | 功能 |
+|-----|------|------|
+| `📈 單股分析` | `render_single_stock_page()` | K線圖、走勢圖、歷史資料表 |
+| `🔍 選股策略｜盤整突破` | `render_screener_page()` | 批次掃描觀察清單 |
+
+### 策略函式統一簽名
+
+```python
+def check_xxx(df: pd.DataFrame, **params) -> Optional[Dict[str, Any]]:
+    # 輸入：已排序（日期升冪）的 DataFrame
+    # 輸出：符合條件 → dict（含關鍵指標）；不符合 → None
+```
+
+新增策略時：① 實作上述函式 → ② 建立對應的 `_render_xxx_params()` → ③ 登記至 `STRATEGY_REGISTRY`
+
+### 策略參數對照表
+
+| 策略 | 關鍵參數 | 預設值 | 調整說明 |
+|------|---------|--------|---------|
+| 盤整突破 | `consolidation_days` | 21 | ↑增大→更長期盤整 |
+| 盤整突破 | `amplitude_threshold` | 10% | ↓減小→更嚴格（更緊密） |
+| 盤整突破 | `volume_ratio` | 1.5x | ↑增大→更強量能 |
+| 爆量長紅 | `volume_ratio` | 2.0x | ↑增大→要求更強爆量 |
+| 爆量長紅 | `body_pct` | 3% | ↑增大→要求更大紅K實體 |
+| 跌深反彈 | `bias_threshold` | -10% | ↓減小→要求更深超跌 |
+| 跌深反彈 | `shadow_ratio` | 0.30 | ↑增大→要求更明顯下影線 |
 
 ### fetch_stock_candles 參數說明
 
