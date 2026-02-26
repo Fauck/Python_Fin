@@ -13,6 +13,9 @@ from fugle_marketdata import RestClient
 
 load_dotenv()
 
+# Fugle API 單次查詢上限（API 要求 < 365 天，保留 5 天緩衝）
+_FUGLE_MAX_RANGE_DAYS = 360
+
 
 # ═════════════════════════════════════════════
 # 資料層：API 呼叫邏輯（與 UI 完全解耦）
@@ -26,6 +29,24 @@ def get_fugle_client() -> RestClient:
     return RestClient(api_key=api_key)
 
 
+def _fetch_chunk(
+    client: RestClient,
+    symbol: str,
+    date_from: str,
+    date_to: str,
+    fields: str,
+) -> List[dict]:
+    """單次 Fugle API 呼叫（日期範圍需 < 365 天），回傳原始 record list。"""
+    raw = client.stock.historical.candles(
+        **{"symbol": symbol, "from": date_from, "to": date_to, "fields": fields}
+    )
+    if isinstance(raw, dict):
+        return list(raw.get("data", []))
+    if isinstance(raw, list):
+        return list(raw)
+    return []
+
+
 def fetch_stock_candles(
     symbol: str,
     limit: int = 10,
@@ -35,6 +56,7 @@ def fetch_stock_candles(
 ) -> pd.DataFrame:
     """
     透過 Fugle Historical API 取得股票 K 線資料。
+    若所需日期範圍超過 API 上限（365 天），自動分段抓取並合併。
 
     Parameters
     ----------
@@ -54,30 +76,34 @@ def fetch_stock_candles(
         date_to = datetime.today().strftime("%Y-%m-%d")
     if date_from is None:
         # 每個交易日約 1.5 個日曆天（含週末、假日），再加 30 天緩衝
-        # 例如 limit=100 → 往前推 180 天，確保拿得到足夠筆數
+        # 例如 limit=300 → 往前推 480 天（需分兩段抓取）
         days_back = max(90, int(limit * 1.5) + 30)
         date_from = (datetime.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
-    raw = client.stock.historical.candles(
-        **{
-            "symbol": symbol,
-            "from": date_from,
-            "to": date_to,
-            "fields": fields,
-        }
-    )
+    dt_from = datetime.strptime(date_from, "%Y-%m-%d")
+    dt_to   = datetime.strptime(date_to,   "%Y-%m-%d")
 
-    if isinstance(raw, dict):
-        records = raw.get("data", [])
-    elif isinstance(raw, list):
-        records = raw
-    else:
-        records = []
+    # ── 分段抓取（Fugle API 限制：單次查詢 < 365 天）──
+    all_records: List[dict] = []
+    chunk_end = dt_to
+    while chunk_end >= dt_from:
+        chunk_start = max(dt_from, chunk_end - timedelta(days=_FUGLE_MAX_RANGE_DAYS - 1))
+        all_records.extend(
+            _fetch_chunk(
+                client, symbol,
+                chunk_start.strftime("%Y-%m-%d"),
+                chunk_end.strftime("%Y-%m-%d"),
+                fields,
+            )
+        )
+        if chunk_start <= dt_from:
+            break
+        chunk_end = chunk_start - timedelta(days=1)
 
-    if not records:
+    if not all_records:
         return pd.DataFrame()
 
-    df = pd.DataFrame(records)
+    df = pd.DataFrame(all_records)
 
     # 統一日期欄位名稱
     date_col = next((c for c in df.columns if "date" in c.lower()), None)
@@ -86,7 +112,9 @@ def fetch_stock_candles(
 
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").reset_index(drop=True)
+        df = (df.drop_duplicates(subset="date")
+                .sort_values("date")
+                .reset_index(drop=True))
 
     return df.tail(limit).reset_index(drop=True)
 

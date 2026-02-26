@@ -4,7 +4,7 @@
           render_ohlcv_chart / render_single_stock_page
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -18,7 +18,30 @@ from utils import fetch_stock_candles, compute_ma, compute_kd
 # 演算法層：均線扣抵值計算（純邏輯，不含 Streamlit 元素）
 # ═════════════════════════════════════════════
 
-def calculate_deduction_values(df: pd.DataFrame) -> Optional[List[Dict[str, Any]]]:
+def _deduction_trend(bias: float) -> Tuple[str, str]:
+    """
+    依乖離率（比例，非百分比）回傳趨勢標籤與顏色。
+
+    Parameters
+    ----------
+    bias : (current_close - deduction_price) / deduction_price，例如 0.02 = 2%
+
+    Returns
+    -------
+    (趨勢文字含 Emoji, 16 進位色碼)
+    """
+    if abs(bias) <= 0.01:          # |乖離| ≤ 1% → 盤整
+        return "🟰 盤整轉折", "#FF9800"
+    elif bias > 0.01:              # 現價 > 扣抵價 → 均線傾向上揚（台灣：紅漲）
+        return "📈 易漲支撐", "#EF5350"
+    else:                          # 現價 < 扣抵價 → 均線傾向下彎（台灣：綠跌）
+        return "📉 易跌壓力", "#26A69A"
+
+
+def calculate_deduction_values(
+    df: pd.DataFrame,
+    display_limit: int,
+) -> Tuple[pd.DataFrame, Optional[List[Dict[str, Any]]]]:
     """
     計算 5MA / 10MA / 20MA / 60MA 的扣抵值與趨勢預判。
 
@@ -27,74 +50,97 @@ def calculate_deduction_values(df: pd.DataFrame) -> Optional[List[Dict[str, Any]
     N 日均線「明日扣抵價」= df.iloc[-N]['close']
     即明天計算均線時，最舊那一筆將被移出的收盤價。
 
-    趨勢預判邏輯（台灣股市習慣：漲紅跌綠）
+    歷史欄位（使用 shift(N)，每個 row 記錄「N 個交易日前的收盤價」）
+    ----------------------------------------------------------------
+    deduction_N  : df['close'].shift(N)                 — 歷史扣抵價（供回測/畫圖）
+    bias_pct_N   : (close - deduction_N) / deduction_N × 100  — 乖離率（百分比）
+    trend_N      : 依乖離率判斷的趨勢標籤字串              — 供圖表顯示
+
+    趨勢預判邏輯（嚴格遵守台股習慣：紅漲綠跌）
     ----------------------------------------
-    |乖離| ≤ 1%           → 🟰 盤整轉折點（橙）
-    current > deduction  → 📈 易漲 / 支撐強（紅）
-    current < deduction  → 📉 易跌 / 壓力大（綠）
+    |乖離| ≤ 1%  → 🟰 盤整轉折（橙）
+    乖離 > +1%   → 📈 易漲支撐（紅）
+    乖離 < -1%   → 📉 易跌壓力（綠）
 
     Parameters
     ----------
-    df : 含 close 欄位的 DataFrame（日期升冪），需至少 45 筆
-         45~59 筆顯示 5MA / 10MA / 20MA；60 筆以上再加 60MA（季線）
+    df            : 含 close 欄位的 DataFrame（日期升冪），需至少 5 筆
+    display_limit : 使用者選擇的顯示天數；只顯示 period ≤ display_limit 的均線
 
     Returns
     -------
-    list of dict，每條均線一筆；資料不足回傳 None
+    Tuple[pd.DataFrame, Optional[List[Dict[str, Any]]]]
+        [0] 含 ma_N / deduction_N / bias_pct_N / trend_N 欄位的完整 DataFrame
+            （供歷史回測與畫圖使用）
+        [1] 最新交易日彙整 List[dict]（每條均線一筆），直接餵給 st.dataframe；
+            無符合條件的均線時回傳 None
     """
-    ALL_CONFIGS = [
+    # 可計算的均線設定：(週期, 標籤, 副標題)
+    ALL_CONFIGS: List[Tuple[int, str, str]] = [
         (5,  "5MA",  "周線"),
         (10, "10MA", "雙周線"),
         (20, "20MA", "月線"),
         (60, "60MA", "季線"),
     ]
 
-    if df.empty or len(df) < 45:
-        return None
-
     df = df.copy().reset_index(drop=True)
 
-    # 資料不足 60 筆時跳過季線
-    MA_CONFIGS = [cfg for cfg in ALL_CONFIGS if len(df) >= cfg[0]]
+    # 篩選：只保留「顯示天數 ≥ 均線週期」且「資料筆數足夠計算」的均線
+    MA_CONFIGS: List[Tuple[int, str, str]] = [
+        cfg for cfg in ALL_CONFIGS
+        if cfg[0] <= display_limit and len(df) >= cfg[0]
+    ]
 
+    if df.empty or not MA_CONFIGS:
+        return df, None
+
+    # ── 歷史欄位：整欄計算（供回測 / 畫圖）────────────────────
     for period, _, _ in MA_CONFIGS:
+        # N 日均線值
         df[f"ma{period}"] = df["close"].rolling(period).mean()
 
-    current_close = float(df.iloc[-1]["close"])
-    results: List[Dict[str, Any]] = []
+        # deduction_N：第 i 行的扣抵價 = 第 i-N 行的收盤（shift(N)）
+        df[f"deduction_{period}"] = df["close"].shift(period)
+
+        # bias_pct_N：乖離率（百分比），NaN 發生於前 N 行資料不足處
+        df[f"bias_pct_{period}"] = (
+            (df["close"] - df[f"deduction_{period}"])
+            / df[f"deduction_{period}"]
+            * 100
+        )
+
+        # trend_N：趨勢標籤字串（NaN 行填 "—"）
+        df[f"trend_{period}"] = df[f"bias_pct_{period}"].apply(
+            lambda b: _deduction_trend(b / 100)[0] if pd.notna(b) else "—"
+        )
+
+    # ── 最新交易日彙整（供 Streamlit 卡片 / 表格顯示）──────────
+    current_close = float(df["close"].iloc[-1])
+    summary: List[Dict[str, Any]] = []
 
     for period, ma_name, subtitle in MA_CONFIGS:
-        ma_val = df.iloc[-1][f"ma{period}"]
+        ma_val = df[f"ma{period}"].iloc[-1]
         if pd.isna(ma_val):
             continue
 
-        # 扣抵價：倒數第 N 筆的收盤價
-        deduction_price = float(df.iloc[-period]["close"])
-        diff_pct = (current_close - deduction_price) / deduction_price * 100
+        # 最新扣抵價：df.iloc[-N]['close']（明日 MA 將移出的最舊一筆）
+        deduction_price = float(df["close"].iloc[-period])
+        bias            = (current_close - deduction_price) / deduction_price
+        trend, color    = _deduction_trend(bias)
 
-        if abs(diff_pct) <= 1.0:
-            trend       = "🟰 盤整轉折點"
-            trend_color = "#FF9800"   # 橙：中性
-        elif diff_pct > 0:
-            trend       = "📈 易漲 / 支撐強"
-            trend_color = "#EF5350"   # 紅：台灣習慣漲用紅
-        else:
-            trend       = "📉 易跌 / 壓力大"
-            trend_color = "#26A69A"   # 綠：台灣習慣跌用綠
-
-        results.append({
+        summary.append({
             "period":          period,
             "ma_name":         ma_name,
             "subtitle":        subtitle,
             "ma_val":          round(float(ma_val), 2),
             "current_close":   round(current_close, 2),
             "deduction_price": round(deduction_price, 2),
-            "diff_pct":        round(diff_pct, 2),
+            "diff_pct":        round(bias * 100, 2),   # 轉為百分比顯示
             "trend":           trend,
-            "trend_color":     trend_color,
+            "trend_color":     color,
         })
 
-    return results if results else None
+    return df, (summary if summary else None)
 
 
 # ═════════════════════════════════════════════
@@ -502,8 +548,9 @@ def render_single_stock_page() -> None:
         render_data_table(df, symbol)
 
         # ── 均線扣抵值模組（使用完整資料集確保季線有效）──
-        deduction_data = calculate_deduction_values(df_full)
+        # df_full 會被回傳並新增 deduction_N / bias_pct_N / trend_N 歷史欄位
+        df_full, deduction_data = calculate_deduction_values(df_full, int(limit))
         if deduction_data:
             render_deduction_section(deduction_data, symbol)
         else:
-            st.info("歷史資料不足 45 個交易日，無法計算均線扣抵值。")
+            st.info("顯示天數不足以計算任何均線扣抵值。")
