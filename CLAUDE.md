@@ -4,10 +4,11 @@
 
 | 項目 | 工具 |
 |------|------|
-| 語言 | Python 3.9 |
+| 語言 | Python 3.12 |
 | 網頁框架 | Streamlit |
 | 資料來源 | fugle-marketdata 2.4.1 |
 | 圖表 | Plotly |
+| 技術指標 | pandas-ta 0.4.71b0 |
 | 環境變數 | python-dotenv |
 | 虛擬環境 | `Fauck_env/` |
 
@@ -15,60 +16,97 @@
 
 ```
 Python_Fin/
-├── app.py            # Streamlit 主程式（核心）
-├── First.py          # 原始 API 測試腳本（勿上傳至版本控制）
-├── requirements.txt  # 相依套件清單
-├── .env              # API Key（已加入 .gitignore，勿上傳）
-├── .env.example      # .env 範本
-├── CLAUDE.md         # 本檔：專案架構說明
-└── Fauck_env/        # Python 虛擬環境
+├── app.py                 # Streamlit 進入點（只含 main()，45 行）
+├── utils.py               # 共用資料層 + 技術指標計算
+├── Single_stock_page.py   # 單股分析頁面模組
+├── Screener_page.py       # 選股策略頁面模組
+├── Score_page.py          # 個股綜合評分頁面模組
+├── First.py               # 原始 API 測試腳本（勿上傳至版本控制）
+├── requirements.txt       # 相依套件清單
+├── .env                   # API Key（已加入 .gitignore，勿上傳）
+├── .env.example           # .env 範本
+├── CLAUDE.md              # 本檔：專案架構說明
+└── Fauck_env/             # Python 虛擬環境
 ```
 
-## app.py 架構
+## 模組架構
+
+### Import 關係（無循環）
+
+```
+app.py
+  ├── Single_stock_page  →  utils
+  ├── Screener_page      →  utils
+  └── Score_page         →  utils
+```
 
 ### 設計原則：資料層、演算法層、UI 層三層解耦
 
 ```
-app.py
-├── 資料層（不含任何 Streamlit 元素）
-│   ├── get_fugle_client()
-│   │     建立並回傳 Fugle RestClient 實例
-│   │     讀取 FUGLE_API_KEY 環境變數
-│   │
-│   └── fetch_stock_candles(symbol, limit, date_from, date_to, fields)
-│         透過 Historical API 取得 K 線資料
-│         回傳已整理好的 pandas DataFrame
+utils.py（共用，不含任何 Streamlit 元素）
+├── get_fugle_client()
+│     建立並回傳 Fugle RestClient 實例
+│     讀取 FUGLE_API_KEY 環境變數
 │
-├── 演算法層（純邏輯，不含任何 Streamlit 元素）
-│   ├── check_consolidation_breakout(df, consolidation_days, amplitude_threshold,
-│   │     volume_ratio, check_volume)        → 盤整突破第一根
-│   ├── check_bullish_ma_alignment(df)       → 均線多頭排列（5/10/20MA）
-│   ├── check_volume_surge_bullish(df, volume_ratio, body_pct) → 爆量長紅起漲
-│   ├── check_oversold_reversal(df, bias_threshold, shadow_ratio) → 乖離過大跌深反彈
-│   │     ↑ 所有策略函式共享相同簽名：輸入 DataFrame，輸出 dict 或 None
-│   │
-│   └── scan_watchlist(symbols, strategy_fn, fetch_limit, sleep_sec, ...)
-│         通用批次掃描引擎，接受任意策略函式
-│         每次呼叫間加入 time.sleep 避免觸發 Rate Limit
-│         回傳 (results, errors) tuple
+├── fetch_stock_candles(symbol, limit, date_from, date_to, fields)
+│     透過 Historical API 取得 K 線資料
+│     回傳已整理好的 pandas DataFrame
 │
-└── UI 層（純渲染，不含業務邏輯）
-    ├── render_data_table(df, symbol)        DataFrame 表格
-    ├── render_close_chart(df, symbol)       收盤價折線圖（Plotly Scatter）
-    ├── render_candlestick_chart(df, symbol) K 線圖（Plotly Candlestick）
-    ├── render_single_stock_page()           單股分析頁面
-    ├── render_screener_page()               盤整突破選股頁面
-    └── main()                              st.tabs 導覽 + 頁面路由
+├── compute_ma(df, periods)
+│     計算多期 SMA；新增 ma5 / ma10 / ma20 等欄位
+│
+└── compute_kd(df, period=9)
+      台灣市場標準 KD（RSV + 1/3 EMA 平滑，初始值 50）
+      新增 k_val / d_val 欄位
+
+Single_stock_page.py
+├── render_data_table(df, symbol)        DataFrame 表格
+├── render_close_chart(df, symbol)       收盤價折線圖（Plotly Scatter）
+├── render_candlestick_chart(df, symbol) K 線圖（Plotly Candlestick）
+├── render_ohlcv_chart(df, symbol, show_ma, show_kd)
+│     K線 + 均線 + 成交量 + 成交值 + KD 子圖（動態 subplots）
+│     x 軸使用 type="category"，所有 x 值統一為字串 "YYYY-MM-DD"
+│     含期間最高 / 最低價標註（arrowhead annotation）
+└── render_single_stock_page()           單股分析頁面
+
+Screener_page.py
+├── 演算法層（純邏輯）
+│   ├── check_consolidation_breakout(df, ...)  → 盤整突破第一根
+│   ├── check_bullish_ma_alignment(df)         → 均線多頭排列（5/10/20MA）
+│   ├── check_volume_surge_bullish(df, ...)    → 爆量長紅起漲
+│   └── check_oversold_reversal(df, ...)       → 乖離過大跌深反彈
+│         ↑ 所有策略函式：輸入 DataFrame，輸出 dict 或 None
+├── scan_watchlist(symbols, strategy_fn, ...)
+│     通用批次掃描引擎，每次呼叫間加入 time.sleep 避免 Rate Limit
+│     回傳 (results, errors) tuple
+├── _render_*_params()  各策略的 UI 參數控制項，回傳 (fn, fetch_limit, info)
+├── STRATEGY_REGISTRY   策略名稱 → _render_*_params 的映射 dict
+├── NO_RESULT_HINTS     策略名稱 → 無結果時的提示文字
+└── render_screener_page()  選股策略頁面
+
+Score_page.py
+├── _SCORE_FETCH_DAYS  = 250   往前推算的日曆天數
+├── _SCORE_FETCH_LIMIT = 120   最多抓取的 K 棒筆數
+├── compute_score(df)
+│     100 分制買進評分（趨勢 30 + 動能 30 + 震盪 20 + 量能 20）
+│     使用 pandas-ta：ta.rsi() / ta.stoch() / ta.macd()
+│     回傳 dict { total, dimensions, details } 或 None
+├── render_radar_chart(score_result)  四維度雷達圖（Plotly Scatterpolar）
+└── render_score_page()              個股綜合評分頁面
+
+app.py（進入點，僅 45 行）
+└── main()  st.set_page_config + st.tabs 導覽 + 頁面路由
 ```
 
 ### 頁面導覽
 
-使用 `st.tabs` 分為兩個頁面，各頁使用 `st.columns([1, 3])` 模擬左欄控制面板：
+使用 `st.tabs` 分為三個頁面，各頁使用 `st.columns([1, 3])` 模擬左欄控制面板：
 
-| Tab | 頁面 | 功能 |
-|-----|------|------|
-| `📈 單股分析` | `render_single_stock_page()` | K線圖、走勢圖、歷史資料表 |
-| `🔍 選股策略｜盤整突破` | `render_screener_page()` | 批次掃描觀察清單 |
+| Tab | 頁面函式 | 功能 |
+|-----|---------|------|
+| `📈 單股分析` | `render_single_stock_page()` | K線圖（含均線/KD）、歷史資料表 |
+| `🔍 選股策略` | `render_screener_page()` | 批次掃描觀察清單（4 種策略） |
+| `🎯 綜合評分` | `render_score_page()` | 100 分制買進評分 + 雷達圖 |
 
 ### 策略函式統一簽名
 
@@ -78,7 +116,7 @@ def check_xxx(df: pd.DataFrame, **params) -> Optional[Dict[str, Any]]:
     # 輸出：符合條件 → dict（含關鍵指標）；不符合 → None
 ```
 
-新增策略時：① 實作上述函式 → ② 建立對應的 `_render_xxx_params()` → ③ 登記至 `STRATEGY_REGISTRY`
+新增策略時：① 在 `Screener_page.py` 實作上述函式 → ② 建立對應的 `_render_xxx_params()` → ③ 登記至 `STRATEGY_REGISTRY`
 
 ### 策略參數對照表
 
@@ -92,13 +130,24 @@ def check_xxx(df: pd.DataFrame, **params) -> Optional[Dict[str, Any]]:
 | 跌深反彈 | `bias_threshold` | -10% | ↓減小→要求更深超跌 |
 | 跌深反彈 | `shadow_ratio` | 0.30 | ↑增大→要求更明顯下影線 |
 
+### 評分維度對照表
+
+| 維度 | 滿分 | 指標 | 得分條件 |
+|------|------|------|---------|
+| 趨勢 Trend | 30 | 10MA / 20MA / 60MA | 收盤 > 各均線各得 10 分 |
+| 動能 Momentum | 30 | RSI(14) | 40~70 或 <30 得 15 分；>80 得 0 分 |
+| 動能 Momentum | — | KD(9,3,3) | K > D 得 15 分 |
+| 震盪 Oscillator | 20 | MACD 柱狀圖 | Hist > 0 得 10 分 |
+| 震盪 Oscillator | — | DIF / DEA | DIF > DEA 得 10 分 |
+| 量能 Volume | 20 | 今日量 vs 5日均量 | 今日量 > 均量得 20 分 |
+
 ### fetch_stock_candles 參數說明
 
 | 參數 | 型別 | 預設值 | 說明 |
 |------|------|--------|------|
 | `symbol` | `str` | 必填 | 股票代號（例如 `"2330"`） |
 | `limit` | `int` | `10` | 最多回傳幾筆交易日資料 |
-| `date_from` | `str \| None` | `None` | 起始日期 `"YYYY-MM-DD"`；`None` 自動往前推 60 天 |
+| `date_from` | `str \| None` | `None` | 起始日期 `"YYYY-MM-DD"`；`None` 自動往前推 90 天 |
 | `date_to` | `str \| None` | `None` | 結束日期 `"YYYY-MM-DD"`；`None` 為今日 |
 | `fields` | `str` | `"open,high,low,close,volume"` | API 回傳欄位（逗號分隔） |
 
@@ -121,22 +170,28 @@ raw = client.stock.historical.candles(**{
 
 ### 新增日期區間選擇器
 
-在 [app.py](app.py) Sidebar 區塊取消以下註解（約第 167–172 行）：
+在 [Single_stock_page.py](Single_stock_page.py) `render_single_stock_page()` 取消以下註解：
 
 ```python
 st.markdown("---")
-st.subheader("自訂日期區間（選填）")
+st.markdown("##### 自訂日期區間（選填）")
 custom_from = st.date_input("起始日期", value=None)
 custom_to   = st.date_input("結束日期",  value=None)
 ```
 
-再將變數傳入 `fetch_stock_candles(date_from=..., date_to=...)` 即可，底層函式無需修改。
+再將變數傳入 `fetch_stock_candles(date_from=..., date_to=...)` 即可，`utils.py` 無需修改。
 
 ### 新增技術指標
 
-1. 在 Sidebar 取消技術指標勾選框的註解（約第 175–178 行）
-2. 在 `fetch_stock_candles` 回傳的 DataFrame 上計算指標（例如 `df["ma5"] = df["close"].rolling(5).mean()`）
-3. 新增對應的 `render_*` 函式渲染至畫面
+1. 在 [utils.py](utils.py) 新增計算函式（例如 `compute_bollinger(df)`）
+2. 在 `Single_stock_page.py` 的 `render_ohlcv_chart` 加入對應 trace
+3. 在 `render_single_stock_page` 控制欄新增勾選框並傳入參數
+
+### 新增選股策略
+
+1. 在 [Screener_page.py](Screener_page.py) 實作 `check_xxx(df)` 函式
+2. 實作對應的 `_render_xxx_params()` → 回傳 `(strategy_fn, fetch_limit, info_text)`
+3. 在 `STRATEGY_REGISTRY` 登記新策略名稱
 
 ## 啟動方式
 
