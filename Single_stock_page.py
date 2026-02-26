@@ -4,7 +4,7 @@
           render_ohlcv_chart / render_single_stock_page
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,6 +12,150 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from utils import fetch_stock_candles, compute_ma, compute_kd
+
+
+# ═════════════════════════════════════════════
+# 演算法層：均線扣抵值計算（純邏輯，不含 Streamlit 元素）
+# ═════════════════════════════════════════════
+
+def calculate_deduction_values(df: pd.DataFrame) -> Optional[List[Dict[str, Any]]]:
+    """
+    計算 5MA / 10MA / 20MA / 60MA 的扣抵值與趨勢預判。
+
+    扣抵值定義
+    ----------
+    N 日均線「明日扣抵價」= df.iloc[-N]['close']
+    即明天計算均線時，最舊那一筆將被移出的收盤價。
+
+    趨勢預判邏輯（台灣股市習慣：漲紅跌綠）
+    ----------------------------------------
+    |乖離| ≤ 1%           → 🟰 盤整轉折點（橙）
+    current > deduction  → 📈 易漲 / 支撐強（紅）
+    current < deduction  → 📉 易跌 / 壓力大（綠）
+
+    Parameters
+    ----------
+    df : 含 close 欄位的 DataFrame（日期升冪），需至少 45 筆
+         45~59 筆顯示 5MA / 10MA / 20MA；60 筆以上再加 60MA（季線）
+
+    Returns
+    -------
+    list of dict，每條均線一筆；資料不足回傳 None
+    """
+    ALL_CONFIGS = [
+        (5,  "5MA",  "周線"),
+        (10, "10MA", "雙周線"),
+        (20, "20MA", "月線"),
+        (60, "60MA", "季線"),
+    ]
+
+    if df.empty or len(df) < 45:
+        return None
+
+    df = df.copy().reset_index(drop=True)
+
+    # 資料不足 60 筆時跳過季線
+    MA_CONFIGS = [cfg for cfg in ALL_CONFIGS if len(df) >= cfg[0]]
+
+    for period, _, _ in MA_CONFIGS:
+        df[f"ma{period}"] = df["close"].rolling(period).mean()
+
+    current_close = float(df.iloc[-1]["close"])
+    results: List[Dict[str, Any]] = []
+
+    for period, ma_name, subtitle in MA_CONFIGS:
+        ma_val = df.iloc[-1][f"ma{period}"]
+        if pd.isna(ma_val):
+            continue
+
+        # 扣抵價：倒數第 N 筆的收盤價
+        deduction_price = float(df.iloc[-period]["close"])
+        diff_pct = (current_close - deduction_price) / deduction_price * 100
+
+        if abs(diff_pct) <= 1.0:
+            trend       = "🟰 盤整轉折點"
+            trend_color = "#FF9800"   # 橙：中性
+        elif diff_pct > 0:
+            trend       = "📈 易漲 / 支撐強"
+            trend_color = "#EF5350"   # 紅：台灣習慣漲用紅
+        else:
+            trend       = "📉 易跌 / 壓力大"
+            trend_color = "#26A69A"   # 綠：台灣習慣跌用綠
+
+        results.append({
+            "period":          period,
+            "ma_name":         ma_name,
+            "subtitle":        subtitle,
+            "ma_val":          round(float(ma_val), 2),
+            "current_close":   round(current_close, 2),
+            "deduction_price": round(deduction_price, 2),
+            "diff_pct":        round(diff_pct, 2),
+            "trend":           trend,
+            "trend_color":     trend_color,
+        })
+
+    return results if results else None
+
+
+# ═════════════════════════════════════════════
+# 展示層：均線扣抵值儀表板
+# ═════════════════════════════════════════════
+
+def render_deduction_section(
+    deduction_data: List[Dict[str, Any]],
+    symbol: str,
+) -> None:
+    """
+    渲染均線扣抵值儀表板：四欄卡片 + 明細表。
+    """
+    st.markdown("---")
+    st.subheader(f"📊 {symbol} 均線扣抵值與趨勢預判")
+    st.caption(
+        "扣抵價 = 明日均線計算中將被移出的那筆收盤價（df.iloc[-N]['close']）｜"
+        "乖離 ≤ ±1% 視為盤整轉折"
+    )
+
+    # ── 欄位數依實際均線數量動態決定（3 或 4 欄）──
+    cols = st.columns(len(deduction_data))
+    for col, d in zip(cols, deduction_data):
+        color = d["trend_color"]
+        with col:
+            st.markdown(f"""
+<div style="
+    border: 1.5px solid {color};
+    border-radius: 10px;
+    padding: 14px 10px;
+    text-align: center;
+    background: {color}12;
+">
+  <div style="font-size:13px; font-weight:700; color:#444;">
+    {d['ma_name']}
+    <span style="font-size:11px; color:#888; font-weight:400;">（{d['subtitle']}）</span>
+  </div>
+  <div style="font-size:18px; font-weight:700; color:{color}; margin:8px 0 6px; line-height:1.3;">
+    {d['trend']}
+  </div>
+  <div style="font-size:12px; color:#555; line-height:2.0;">
+    均線值&emsp;<b style="color:#333;">{d['ma_val']:,.2f}</b><br>
+    扣抵價&emsp;<b style="color:{color};">{d['deduction_price']:,.2f}</b><br>
+    乖離幅度&emsp;<b style="color:{color};">{d['diff_pct']:+.2f}%</b>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ── 明細表 ────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    table_rows = [
+        {
+            "均線":       f"{d['ma_name']}（{d['subtitle']}）",
+            "目前收盤價": d["current_close"],
+            "均線值":     d["ma_val"],
+            "明日扣抵價": d["deduction_price"],
+            "乖離幅度(%)": f"{d['diff_pct']:+.2f}%",
+            "趨勢預判":   d["trend"],
+        }
+        for d in deduction_data
+    ]
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
 
 # ═════════════════════════════════════════════
@@ -23,7 +167,7 @@ def render_data_table(df: pd.DataFrame, symbol: str) -> None:
     st.subheader(f"📋 {symbol} 近期歷史資料")
     display_df = df.copy()
     if "date" in display_df.columns:
-        display_df["date"] = display_df["date"].dt.strftime("%Y-%m-%d")
+        display_df["date"] = pd.to_datetime(display_df["date"]).dt.strftime("%Y-%m-%d")
     col_map = {
         "date": "日期", "open": "開盤價", "high": "最高價",
         "low": "最低價", "close": "收盤價", "volume": "成交量",
@@ -31,7 +175,7 @@ def render_data_table(df: pd.DataFrame, symbol: str) -> None:
     display_df = display_df.rename(
         columns={k: v for k, v in col_map.items() if k in display_df.columns}
     )
-    st.dataframe(display_df, width="stretch", hide_index=True)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 def render_close_chart(df: pd.DataFrame, symbol: str) -> None:
@@ -114,7 +258,7 @@ def render_ohlcv_chart(
     ma_periods   = show_ma or []
 
     # 將日期轉為字串，確保 category 軸的 x 值與標註 x 值完全一致
-    x_labels = df["date"].dt.strftime("%Y-%m-%d")
+    x_labels = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
 
     # ── 動態建立子圖列表 ─────────────────────────
     # 每個 dict：title、base_height（歸一化前）
@@ -152,9 +296,9 @@ def render_ohlcv_chart(
         idx_high   = int(df["high"].idxmax())
         idx_low    = int(df["low"].idxmin())
         high_date  = x_labels.iloc[idx_high]
-        high_price = float(df.loc[idx_high, "high"])
+        high_price = float(df["high"].iloc[idx_high])
         low_date   = x_labels.iloc[idx_low]
-        low_price  = float(df.loc[idx_low,  "low"])
+        low_price  = float(df["low"].iloc[idx_low])
 
         # 最高價：箭頭朝上，文字在 K 棒上方
         fig.add_annotation(
@@ -236,11 +380,11 @@ def render_ohlcv_chart(
             mode="lines", name="D",
             line=dict(color="#2196F3", width=1.5),
         ), row=current_row, col=1)
-        # 超買 / 超賣參考線
+        # 超買 / 超賣參考線（Plotly stubs 將 row 標為 str，但實際接受 int）
         fig.add_hline(y=80, line=dict(color="#EF5350", dash="dash", width=1),
-                      row=current_row, col=1)
+                      row=current_row, col=1)  # type: ignore[arg-type]
         fig.add_hline(y=20, line=dict(color="#26A69A", dash="dash", width=1),
-                      row=current_row, col=1)
+                      row=current_row, col=1)  # type: ignore[arg-type]
         fig.update_yaxes(range=[0, 100], title_text="KD", row=current_row, col=1)
 
     # ── 全域版面 ──────────────────────────────────
@@ -273,9 +417,9 @@ def render_single_stock_page() -> None:
     with ctrl_col:
         st.markdown("#### 查詢條件")
         symbol = st.text_input(
-            "股票代號", value="2330", max_chars=10,
+            "股票代號", value="1815", max_chars=10,
             key="single_stock_symbol",
-            help="輸入台灣股票代號，例如 2330（台積電）",
+            help="輸入台灣股票代號，例如 1815、2345、0050",
         ).strip()
         limit = st.number_input(
             "顯示天數", min_value=1, max_value=60, value=10, step=1,
@@ -294,7 +438,7 @@ def render_single_stock_page() -> None:
         show_ma20 = st.checkbox("MA20", value=True)
         show_kd   = st.checkbox("KD 值（9日）", value=True)
 
-        query_btn = st.button("查詢", type="primary", width="stretch")
+        query_btn = st.button("查詢", type="primary", use_container_width=True)
 
     with result_col:
         if not query_btn:
@@ -310,8 +454,9 @@ def render_single_stock_page() -> None:
 
         # 計算指標需要額外的暖機資料
         # MA20 需 20 筆、KD(9) 需 9 筆，加 buffer 確保首幾筆也準確
+        # 季線（60MA）扣抵值計算需至少 60 筆，故 fetch_limit 至少取 100
         warmup = max([0] + ma_periods + ([9] if show_kd else [])) + 20
-        fetch_limit = int(limit) + warmup
+        fetch_limit = max(int(limit) + warmup, 100)
 
         with st.spinner(f"正在取得 {symbol} 的歷史資料…"):
             try:
@@ -355,3 +500,10 @@ def render_single_stock_page() -> None:
         st.markdown("---")
         render_ohlcv_chart(df, symbol, show_ma=ma_periods, show_kd=show_kd)
         render_data_table(df, symbol)
+
+        # ── 均線扣抵值模組（使用完整資料集確保季線有效）──
+        deduction_data = calculate_deduction_values(df_full)
+        if deduction_data:
+            render_deduction_section(deduction_data, symbol)
+        else:
+            st.info("歷史資料不足 45 個交易日，無法計算均線扣抵值。")

@@ -75,7 +75,7 @@ def check_consolidation_breakout(
         return None
 
     return {
-        "日期":       today["date"].strftime("%Y-%m-%d"),
+        "日期":       pd.Timestamp(today["date"]).strftime("%Y-%m-%d"),
         "收盤價":     round(today_close, 2),
         "箱頂":       round(box_high, 2),
         "箱底":       round(box_low, 2),
@@ -128,7 +128,7 @@ def check_bullish_ma_alignment(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return None
 
     return {
-        "日期":         latest["date"].strftime("%Y-%m-%d"),
+        "日期":         pd.Timestamp(latest["date"]).strftime("%Y-%m-%d"),
         "收盤價":       round(close, 2),
         "5MA":          round(ma5, 2),
         "10MA":         round(ma10, 2),
@@ -183,7 +183,7 @@ def check_volume_surge_bullish(
         return None
 
     return {
-        "日期":        today["date"].strftime("%Y-%m-%d"),
+        "日期":        pd.Timestamp(today["date"]).strftime("%Y-%m-%d"),
         "收盤價":      round(today_close, 2),
         "K棒漲幅(%)":  round(body_ratio * 100, 2),
         "今日量":      int(today_volume),
@@ -242,7 +242,7 @@ def check_oversold_reversal(
         return None
 
     return {
-        "日期":         today["date"].strftime("%Y-%m-%d"),
+        "日期":         pd.Timestamp(today["date"]).strftime("%Y-%m-%d"),
         "收盤價":       round(close, 2),
         "月線(20MA)":   round(ma20, 2),
         "乖離率(%)":    round(bias * 100, 2),
@@ -450,7 +450,7 @@ def render_screener_page() -> None:
         strategy_fn, fetch_limit, info_text = render_params_fn()
 
         st.markdown("---")
-        scan_btn = st.button("開始掃描", type="primary", width="stretch")
+        scan_btn = st.button("開始掃描", type="primary", use_container_width=True)
 
     with result_col:
         st.markdown("#### 觀察清單")
@@ -476,13 +476,19 @@ def render_screener_page() -> None:
         progress_bar = st.progress(0, text="準備掃描…")
         status_text  = st.empty()
 
+        def _on_progress(p: float) -> None:
+            progress_bar.progress(p)
+
+        def _on_status(msg: str) -> None:
+            status_text.text(msg)
+
         results, errors = scan_watchlist(
             symbols=symbols,
             strategy_fn=strategy_fn,
             fetch_limit=fetch_limit,
             sleep_sec=0.2,
-            progress_callback=lambda p: progress_bar.progress(p),
-            status_callback=lambda msg: status_text.text(msg),
+            progress_callback=_on_progress,
+            status_callback=_on_status,
         )
 
         progress_bar.empty()
@@ -497,10 +503,10 @@ def render_screener_page() -> None:
             result_df = pd.DataFrame(results)
             # 對所有數值欄位格式化為小數點後兩位
             float_cols = result_df.select_dtypes(include="float").columns
-            fmt = {col: "{:.2f}" for col in float_cols}
+            fmt: Dict[str, Any] = {col: "{:.2f}" for col in float_cols}
             st.dataframe(
                 result_df.style.format(fmt, na_rep="—"),
-                width="stretch",
+                use_container_width=True,
                 hide_index=True,
             )
         else:
@@ -509,4 +515,4 @@ def render_screener_page() -> None:
 
         if errors:
             with st.expander(f"查詢異常清單（{len(errors)} 檔）"):
-                st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
+                st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)

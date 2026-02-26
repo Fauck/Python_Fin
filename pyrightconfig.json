@@ -1,0 +1,6 @@
+{
+  "include": ["."],
+  "exclude": ["Fauck_env"],
+  "venvPath": ".",
+  "venv": "Fauck_env"
+}

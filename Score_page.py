@@ -55,7 +55,8 @@ def compute_score(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     # ── RSI(14)：pandas-ta 函式風格呼叫 ───────────
     # 回傳 Series，名稱為 "RSI_14"
-    df["rsi14"] = ta.rsi(df["close"], length=14)
+    _rsi = ta.rsi(df["close"], length=14)
+    df["rsi14"] = _rsi if _rsi is not None else float("nan")
 
     # ── KD(9,3,3)：pandas-ta stoch ────────────────
     # 回傳 DataFrame，欄位 STOCHk_9_3_3 / STOCHd_9_3_3
@@ -64,7 +65,8 @@ def compute_score(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         df["k_stoch"] = _stoch["STOCHk_9_3_3"].values
         df["d_stoch"] = _stoch["STOCHd_9_3_3"].values
     else:
-        df["k_stoch"] = df["d_stoch"] = float("nan")
+        df["k_stoch"] = float("nan")
+        df["d_stoch"] = float("nan")
 
     # ── MACD(12,26,9)：pandas-ta 函式風格呼叫 ────
     # 回傳 DataFrame，欄位：
@@ -77,7 +79,9 @@ def compute_score(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         df["macd_hist"] = _macd["MACDh_12_26_9"].values
         df["macd_dea"]  = _macd["MACDs_12_26_9"].values
     else:
-        df["macd_dif"] = df["macd_hist"] = df["macd_dea"] = float("nan")
+        df["macd_dif"]  = float("nan")
+        df["macd_hist"] = float("nan")
+        df["macd_dea"]  = float("nan")
 
     # ── 取最後一根 K 棒的各指標值 ──────────────────
     last = df.iloc[-1]
@@ -207,14 +211,14 @@ def render_radar_chart(score_result: Dict[str, Any]) -> None:
     """
     dims       = score_result["dimensions"]
     dim_keys   = ["trend", "momentum", "oscillator", "volume"]
-    labels     = [dims[k]["label"] for k in dim_keys]
-    pcts       = [dims[k]["score"] / dims[k]["max"] * 100 for k in dim_keys]
+    labels     = [str(dims[k]["label"]) for k in dim_keys]
+    pcts       = [int(dims[k]["score"]) / int(dims[k]["max"]) * 100 for k in dim_keys]
 
     # 閉合多邊形
     r_vals     = pcts     + [pcts[0]]
     theta_vals = labels   + [labels[0]]
 
-    total = score_result["total"]
+    total = int(score_result["total"])
     if total >= 80:
         fill_color, line_color = "rgba(76,175,80,0.20)", "#4CAF50"
     elif total >= 50:
@@ -273,7 +277,7 @@ def render_score_page() -> None:
             f"抓取最近 {_SCORE_FETCH_LIMIT} 個交易日資料\n"
             "（確保季線 60MA 與 MACD 計算準確）"
         )
-        query_btn = st.button("開始評分", type="primary", width="stretch")
+        query_btn = st.button("開始評分", type="primary", use_container_width=True)
 
     with result_col:
         if not query_btn:
@@ -313,7 +317,7 @@ def render_score_page() -> None:
             )
             return
 
-        total = score_result["total"]
+        total = int(score_result["total"])
 
         # ── 大字體總分（依分段著色）────────────────
         if total >= 80:
@@ -347,10 +351,10 @@ def render_score_page() -> None:
         # ── 四維度分數卡片 ─────────────────────────
         dims = score_result["dimensions"]
         d1, d2, d3, d4 = st.columns(4)
-        d1.metric("趨勢 Trend",      f"{dims['trend']['score']} / {dims['trend']['max']}")
-        d2.metric("動能 Momentum",   f"{dims['momentum']['score']} / {dims['momentum']['max']}")
-        d3.metric("震盪 Oscillator", f"{dims['oscillator']['score']} / {dims['oscillator']['max']}")
-        d4.metric("量能 Volume",     f"{dims['volume']['score']} / {dims['volume']['max']}")
+        d1.metric("趨勢 Trend",      f"{int(dims['trend']['score'])} / {int(dims['trend']['max'])}")
+        d2.metric("動能 Momentum",   f"{int(dims['momentum']['score'])} / {int(dims['momentum']['max'])}")
+        d3.metric("震盪 Oscillator", f"{int(dims['oscillator']['score'])} / {int(dims['oscillator']['max'])}")
+        d4.metric("量能 Volume",     f"{int(dims['volume']['score'])} / {int(dims['volume']['max'])}")
 
         st.markdown("---")
 
@@ -364,4 +368,4 @@ def render_score_page() -> None:
         with table_col:
             st.markdown("##### 指標明細")
             detail_df = pd.DataFrame(score_result["details"])
-            st.dataframe(detail_df, width="stretch", hide_index=True)
+            st.dataframe(detail_df, use_container_width=True, hide_index=True)

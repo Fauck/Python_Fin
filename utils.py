@@ -53,8 +53,10 @@ def fetch_stock_candles(
     if date_to is None:
         date_to = datetime.today().strftime("%Y-%m-%d")
     if date_from is None:
-        # 往前推 90 天，確保涵蓋足夠的交易日（含假期、休市）
-        date_from = (datetime.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+        # 每個交易日約 1.5 個日曆天（含週末、假日），再加 30 天緩衝
+        # 例如 limit=100 → 往前推 180 天，確保拿得到足夠筆數
+        days_back = max(90, int(limit * 1.5) + 30)
+        date_from = (datetime.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
     raw = client.stock.historical.candles(
         **{
