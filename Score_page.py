@@ -12,6 +12,7 @@ import pandas_ta as ta  # noqa: F401
 import plotly.graph_objects as go
 import streamlit as st
 
+from chips_analyzer import fetch_dividends
 from utils import fetch_stock_candles
 
 
@@ -183,7 +184,7 @@ def compute_score_mode_a(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 # 評分模型：模式 B — 長線資產累積
 # ═════════════════════════════════════════════
 
-def compute_score_mode_b(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+def compute_score_mode_b(df: pd.DataFrame, yield_bonus: int = 0) -> Optional[Dict[str, Any]]:
     """
     模式 B：長線資產累積評分（100 分制）。
 
@@ -287,7 +288,7 @@ def compute_score_mode_b(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         kd_pts, kd_st = 0, "資料不足"
 
     lt_baseline_score = kd_pts
-    total_score = price_level_score + oversold_score + lt_baseline_score
+    total_score = min(100, price_level_score + oversold_score + lt_baseline_score + yield_bonus)
 
     details: List[Dict[str, str]] = [
         {"維度": "價格位階 Price Level", "指標": "60 / 240MA 位置",
@@ -300,6 +301,14 @@ def compute_score_mode_b(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         {"維度": "長線基期 LT Baseline", "指標": "KD 低檔黃金交叉",
          "數值": f"K={_n(k_)} D={_n(d_)}", "判斷": kd_st, "得分": f"{kd_pts} / 20"},
     ]
+
+    if yield_bonus > 0:
+        details.append({
+            "維度": "基本面 Fundamentals", "指標": "現金殖利率 ≥ 5%",
+            "數值": f"加分 +{yield_bonus}",
+            "判斷": "✅ 殖利率達標（長線配息加分）",
+            "得分": f"{yield_bonus} / 10",
+        })
 
     return {
         "total": total_score,
@@ -439,10 +448,23 @@ def render_score_page() -> None:
             st.warning(f"查無 **{symbol}** 的資料，請確認代號是否正確。")
             return
 
+        # ── 模式 B：計算殖利率加分 ──────────────────
+        yield_bonus = 0
+        if mode == MODE_B and not df_full.empty:
+            try:
+                div_data = fetch_dividends(symbol)
+                if div_data is not None:
+                    avg_cash      = div_data["avg_cash_3yr"]
+                    current_close = float(df_full["close"].iloc[-1])
+                    if current_close > 0 and avg_cash / current_close * 100 >= 5.0:
+                        yield_bonus = 10
+            except Exception:
+                yield_bonus = 0
+
         if mode == MODE_A:
             score_result = compute_score_mode_a(df_full)
         else:
-            score_result = compute_score_mode_b(df_full)
+            score_result = compute_score_mode_b(df_full, yield_bonus=yield_bonus)
 
         if score_result is None:
             st.warning(

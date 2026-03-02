@@ -15,6 +15,8 @@ import streamlit as st
 from Single_stock_page import render_single_stock_page
 from Screener_page import render_screener_page
 from Score_page import render_score_page
+from chips_analyzer import render_chips_page
+from backtester import render_backtest_page
 
 
 def main() -> None:
@@ -26,8 +28,8 @@ def main() -> None:
     st.title("📊 台股分析儀表板")
     st.caption("資料來源：Fugle Market Data API")
 
-    tab_single, tab_screener, tab_score = st.tabs(
-        ["📈 單股分析", "🔍 選股策略", "🎯 綜合評分"]
+    tab_single, tab_screener, tab_score, tab_chips, tab_backtest = st.tabs(
+        ["📈 單股分析", "🔍 選股策略", "🎯 綜合評分", "🏦 籌碼分析", "🔁 策略回測"]
     )
 
     with tab_single:
@@ -38,6 +40,12 @@ def main() -> None:
 
     with tab_score:
         render_score_page()
+
+    with tab_chips:
+        render_chips_page()
+
+    with tab_backtest:
+        render_backtest_page()
 
 
 if __name__ == "__main__":
