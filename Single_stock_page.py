@@ -273,19 +273,55 @@ def analyze_entry_signal(df_full: pd.DataFrame) -> Optional[Dict[str, Any]]:
             ok, 10 if ok else 0, 10,
             f"K = {k_val:.1f}，D = {d_val:.1f}（{'K > D 多頭' if ok else 'K < D 空頭'}）")
 
-    # ── 波動 (布林) ───────────────────────────
+    # ── 波動①：布林通道位置 (10 pts) ─────────────
     bb_mid   = _sf(r.get("bb_mid"))
     bb_upper = _sf(r.get("bb_upper"))
     bb_lower = _sf(r.get("bb_lower"))
     if bb_mid is not None and bb_upper is not None:
         if close >= bb_upper:
-            pts, ok, msg = 3, False, f"突破上軌 {bb_upper:.2f}，注意超買"
+            pts, ok, msg = 3, False, f"突破上軌 {bb_upper:.2f}，留意超買延伸"
         elif close > bb_mid:
             pts, ok, msg = 10, True,  f"中軌 {bb_mid:.2f} 上方，布林多頭區"
         else:
             ll = f"，近下軌 {bb_lower:.2f}" if bb_lower is not None else ""
             pts, ok, msg = 0, False, f"中軌 {bb_mid:.2f} 下方，布林空頭區{ll}"
         add("📊 波動", "布林通道位置", ok, pts, 10, msg)
+
+    # ── 波動②：BB 壓縮突破訊號 (10 pts) ─────────
+    # 壓縮定義：近 5 日平均帶寬 < 0.10（籌碼極度壓縮）
+    # 高勝率：壓縮 + 突破上軌 + 爆量（三者同時）
+    _BW_THRESHOLD = 0.10
+    if "bb_width" in df.columns and bb_mid is not None and bb_upper is not None:
+        bw_series = df["bb_width"].dropna()
+        if len(bw_series) >= 5:
+            avg_bw_5d  = float(bw_series.iloc[-5:].mean())
+            is_squeeze  = avg_bw_5d < _BW_THRESHOLD
+            is_breakout = close >= bb_upper
+
+            vol_v    = _sf(r.get("volume"))
+            avg5_vol = (float(df["volume"].iloc[-6:-1].mean())
+                        if "volume" in df.columns and len(df) >= 6 else None)
+            vol_surge = (vol_v is not None and avg5_vol is not None
+                         and avg5_vol > 0 and vol_v > avg5_vol * 1.5)
+
+            if is_squeeze and is_breakout and vol_surge:
+                pts, ok = 10, True
+                msg = (f"壓縮突破上軌且爆量"
+                       f"（5日均帶寬 {avg_bw_5d:.3f} < {_BW_THRESHOLD}）— 最高勝率訊號 ⭐")
+            elif is_squeeze and is_breakout:
+                pts, ok = 7, True
+                msg = (f"壓縮後突破上軌（5日均帶寬 {avg_bw_5d:.3f}），"
+                       "放量確認後信號更強")
+            elif is_squeeze:
+                pts, ok = 5, True
+                msg = (f"通道壓縮中（5日均帶寬 {avg_bw_5d:.3f} < {_BW_THRESHOLD}），"
+                       "等待突破上軌方向")
+            else:
+                pts, ok = 0, False
+                msg = (f"通道未達壓縮（5日均帶寬 {avg_bw_5d:.3f}"
+                       f" ≥ {_BW_THRESHOLD}），無擠壓爆發條件")
+
+            add("📊 波動", "BB壓縮突破訊號", ok, pts, 10, msg)
 
     # ── 量能 ─────────────────────────────────
     vol_today = _sf(r.get("volume"))

@@ -299,65 +299,96 @@ def check_52week_high_breakout(
 
 
 # ─────────────────────────────────────────────
-# 策略六：布林通道擠壓突破
+# 策略六：布林通道壓縮突破（升級版）
 # ─────────────────────────────────────────────
-# 邏輯：帶寬縮至歷史低百分位（擠壓）後，今日收盤突破上軌
-# 意義：波動率由低轉高的方向性突破，常伴隨較強趨勢行情
+# 邏輯：
+#   壓縮判定 ── 過去 lookback_days 日平均帶寬 < bandwidth_threshold
+#   突破條件 ── 今日收盤 > 布林上軌
+#   量能確認 ── 今日量 > 近 5 日均量 × volume_ratio
 # 參數調整說明：
-#   period             預設 20    布林通道計算週期
+#   period             預設 20    布林通道計算週期（月線）
 #   std_dev            預設 2.0   標準差倍數（上下軌距）
-#   squeeze_percentile 預設 20    帶寬低於歷史此百分位才視為擠壓
+#   bandwidth_threshold 預設 0.10  5日均帶寬低於此值視為壓縮（10%，參數可調）
+#   lookback_days      預設 5     計算平均帶寬的回看天數
+#   volume_ratio       預設 1.5   突破當日需放量倍數
 # ─────────────────────────────────────────────
 
 def check_bollinger_squeeze_breakout(
     df: pd.DataFrame,
     period: int = 20,
     std_dev: float = 2.0,
-    squeeze_percentile: int = 20,
+    bandwidth_threshold: float = 0.10,
+    lookback_days: int = 5,
+    volume_ratio: float = 1.5,
 ) -> Optional[Dict[str, Any]]:
-    """判斷股票是否符合「布林通道擠壓突破」條件。"""
+    """
+    判斷股票是否符合「布林通道壓縮突破」條件（升級版）。
+
+    壓縮定義
+    --------
+    過去 lookback_days 個交易日的平均帶寬（(上軌-下軌)/中軌）
+    低於 bandwidth_threshold（預設 10%），代表籌碼極度壓縮。
+
+    高勝率買點條件（三者同時成立）
+    --------------------------------
+    A. 壓縮：lookback_days 日平均帶寬 < bandwidth_threshold
+    B. 突破：今日收盤 > 布林上軌（std_dev σ）
+    C. 量能：今日成交量 > 近 5 日均量 × volume_ratio
+    """
     required_cols = {"open", "high", "low", "close", "volume", "date"}
     if not required_cols.issubset(df.columns):
         return None
-    if len(df) < period + 30:  # 需要足夠歷史資料計算百分位
+    if len(df) < period + lookback_days + 5:
         return None
 
     df = df.copy()
-    rolling        = df["close"].rolling(period)
-    df["_bb_mid"]  = rolling.mean()
-    rolling_std    = rolling.std()
+    rolling         = df["close"].rolling(period)
+    df["_bb_mid"]   = rolling.mean()
+    rolling_std     = rolling.std()
     df["_bb_upper"] = df["_bb_mid"] + std_dev * rolling_std
-    df["_bb_width"] = (std_dev * 2 * rolling_std) / df["_bb_mid"]
+    df["_bb_lower"] = df["_bb_mid"] - std_dev * rolling_std
+    df["_bb_width"] = (df["_bb_upper"] - df["_bb_lower"]) / df["_bb_mid"]
 
     today = df.iloc[-1]
-    prev  = df.iloc[-2]
 
-    if pd.isna(today["_bb_upper"]) or pd.isna(prev["_bb_width"]):
+    if pd.isna(today["_bb_upper"]) or pd.isna(today["_bb_width"]):
         return None
 
     close    = float(today["close"])
     bb_upper = float(today["_bb_upper"])
+    bb_lower = float(today["_bb_lower"])
     bb_mid   = float(today["_bb_mid"])
 
-    # 今日收盤需突破布林上軌
+    # ── 條件 B：突破布林上軌 ──
     if close <= bb_upper:
         return None
 
-    # 昨日帶寬需處於歷史低百分位（擠壓狀態）
-    hist_widths   = df["_bb_width"].dropna()
-    prev_width    = float(prev["_bb_width"])
-    width_pct_rank = float((hist_widths <= prev_width).mean() * 100)
-    if width_pct_rank > squeeze_percentile:
+    # ── 條件 A：過去 lookback_days 日平均帶寬 < threshold ──
+    valid_widths = df["_bb_width"].dropna()
+    if len(valid_widths) < lookback_days:
+        return None
+    avg_bandwidth = float(valid_widths.iloc[-lookback_days:].mean())
+    if avg_bandwidth >= bandwidth_threshold:
+        return None
+
+    # ── 條件 C：量能確認 ──
+    today_volume  = float(today["volume"])
+    avg_5d_volume = float(df.iloc[-6:-1]["volume"].mean())
+    if avg_5d_volume <= 0 or today_volume < avg_5d_volume * volume_ratio:
         return None
 
     return {
-        "日期":          pd.Timestamp(today["date"]).strftime("%Y-%m-%d"),
-        "收盤價":        round(close, 2),
-        "布林上軌":      round(bb_upper, 2),
-        "布林中軌":      round(bb_mid, 2),
-        "突破幅度(%)":   round((close - bb_upper) / bb_upper * 100, 2),
-        "帶寬百分位(%)": round(width_pct_rank, 1),
-        "成交量":        int(today["volume"]),
+        "日期":              pd.Timestamp(today["date"]).strftime("%Y-%m-%d"),
+        "收盤價":            round(close, 2),
+        "布林上軌":          round(bb_upper, 2),
+        "布林中軌":          round(bb_mid, 2),
+        "布林下軌":          round(bb_lower, 2),
+        "突破幅度(%)":       round((close - bb_upper) / bb_upper * 100, 2),
+        f"{lookback_days}日均帶寬": round(avg_bandwidth, 4),
+        "壓縮閾值":          bandwidth_threshold,
+        "今日量":            int(today_volume),
+        "5日均量":           int(avg_5d_volume),
+        "量比":              round(today_volume / avg_5d_volume, 2),
     }
 
 
@@ -535,31 +566,48 @@ def _render_52week_params() -> Tuple[Callable, int, str]:
 
 
 def _render_bb_squeeze_params() -> Tuple[Callable, int, str]:
-    """布林通道擠壓突破：渲染參數控制項。"""
+    """布林通道壓縮突破（升級版）：渲染參數控制項。"""
     period = st.number_input(
         "布林週期", min_value=10, max_value=60, value=20, step=1,
-        help="計算布林通道使用的天數，預設 20",
+        help="計算布林通道使用的天數，預設 20（月線）",
         key="sc_bb_period",
-    )
-    squeeze_pct = st.slider(
-        "擠壓百分位（%）", min_value=5, max_value=40, value=20, step=5,
-        help="昨日帶寬低於歷史此百分位，才視為擠壓狀態",
-        key="sc_bb_squeeze",
     )
     std_dev = st.select_slider(
         "標準差倍數（σ）", options=[1.5, 2.0, 2.5, 3.0], value=2.0,
         help="布林通道寬度（標準差倍數），預設 2.0",
         key="sc_bb_std",
     )
-    p  = int(period)
-    sp = int(squeeze_pct)
-    sd = float(std_dev)
-    info = (
-        f"- **布林擠壓**：昨日帶寬低於歷史 {sp}% 百分位\n"
-        f"- **突破上軌**：今日收盤 > 布林上軌（{sd:.1f}σ，週期 {p}）\n"
-        "- 擠壓後方向性突破通常伴隨較強走勢"
+    st.markdown("---")
+    st.caption("壓縮濾網設定")
+    bw_threshold = st.slider(
+        "帶寬壓縮門檻（%）", min_value=5, max_value=25, value=10, step=1,
+        help="過去 N 日平均帶寬低於此值視為壓縮，預設 10%（籌碼極度集中）",
+        key="sc_bb_bw_thr",
+    ) / 100.0
+    lookback = st.number_input(
+        "壓縮回看天數", min_value=3, max_value=10, value=5, step=1,
+        help="計算平均帶寬的回看天數，預設 5 日",
+        key="sc_bb_lookback",
     )
-    return lambda df: check_bollinger_squeeze_breakout(df, p, sd, sp), p + 50, info
+    vol_ratio = st.slider(
+        "突破量能倍數", min_value=1.0, max_value=3.0, value=1.5, step=0.1,
+        help="突破上軌當日成交量需 > 近 5 日均量 × 此倍數",
+        key="sc_bb_vol",
+    )
+
+    p   = int(period)
+    sd  = float(std_dev)
+    bwt = float(bw_threshold)
+    lb  = int(lookback)
+    vr  = float(vol_ratio)
+
+    info = (
+        f"- **壓縮判定**：過去 {lb} 日平均帶寬 < {bwt*100:.0f}%（籌碼極度壓縮）\n"
+        f"- **突破上軌**：今日收盤 > 布林上軌（{sd:.1f}σ，週期 {p}）\n"
+        f"- **量能確認**：今日量 > 5 日均量 × {vr:.1f} 倍\n"
+        "- 三條件同時成立，為壓縮後爆發型高勝率買點"
+    )
+    return lambda df: check_bollinger_squeeze_breakout(df, p, sd, bwt, lb, vr), p + 50, info
 
 
 # ─────────────────────────────────────────────
@@ -580,7 +628,7 @@ NO_RESULT_HINTS: Dict[str, str] = {
     "爆量長紅起漲":      "可嘗試：降低爆量倍數或 K 棒漲幅門檻後重新掃描。",
     "乖離過大跌深反彈":  "可嘗試：將負乖離門檻放寬（例如 -8%）或降低下影線比例。",
     "52週高點突破":      "可嘗試：降低量能確認倍數，或確認觀察清單標的歷史資料足夠（需 253 個交易日以上）。",
-    "布林擠壓突破":      "可嘗試：放寬擠壓百分位（例如 30%）或縮短布林週期後重新掃描。",
+    "布林擠壓突破":      "可嘗試：放寬帶寬壓縮門檻（例如 15%）、縮短回看天數或降低量能倍數後重新掃描。",
 }
 
 
