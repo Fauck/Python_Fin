@@ -251,6 +251,116 @@ def check_oversold_reversal(
     }
 
 
+# ─────────────────────────────────────────────
+# 策略五：52 週高點突破
+# ─────────────────────────────────────────────
+# 邏輯：今日收盤 > 前 252 個交易日最高收盤，且帶量確認
+# 意義：動能加速訊號——創近一年新高，代表多頭力道充沛
+# 參數調整說明：
+#   volume_ratio 預設 1.3 ↑增大→要求更強量能確認
+# ─────────────────────────────────────────────
+
+def check_52week_high_breakout(
+    df: pd.DataFrame,
+    volume_ratio: float = 1.3,
+) -> Optional[Dict[str, Any]]:
+    """判斷股票是否符合「52 週高點突破」條件。"""
+    required_cols = {"open", "high", "low", "close", "volume", "date"}
+    if not required_cols.issubset(df.columns):
+        return None
+    if len(df) < 253:  # 需要 252 個交易日 + 今日
+        return None
+
+    today      = df.iloc[-1]
+    prev_252   = df.iloc[-253:-1]           # 前 252 日（不含今日）
+
+    close         = float(today["close"])
+    high_252_cl   = float(prev_252["close"].max())  # 前 252 日最高收盤
+
+    # 今日收盤需突破 52 週最高收盤
+    if close <= high_252_cl:
+        return None
+
+    # 量能確認：今日量 > 近 5 日均量 × volume_ratio
+    today_volume  = float(today["volume"])
+    avg_5d_volume = float(df.iloc[-6:-1]["volume"].mean())
+    if avg_5d_volume <= 0 or today_volume < avg_5d_volume * volume_ratio:
+        return None
+
+    return {
+        "日期":        pd.Timestamp(today["date"]).strftime("%Y-%m-%d"),
+        "收盤價":      round(close, 2),
+        "52週高點":    round(high_252_cl, 2),
+        "突破幅度(%)": round((close - high_252_cl) / high_252_cl * 100, 2),
+        "今日量":      int(today_volume),
+        "5日均量":     int(avg_5d_volume),
+        "量比":        round(today_volume / avg_5d_volume, 2),
+    }
+
+
+# ─────────────────────────────────────────────
+# 策略六：布林通道擠壓突破
+# ─────────────────────────────────────────────
+# 邏輯：帶寬縮至歷史低百分位（擠壓）後，今日收盤突破上軌
+# 意義：波動率由低轉高的方向性突破，常伴隨較強趨勢行情
+# 參數調整說明：
+#   period             預設 20    布林通道計算週期
+#   std_dev            預設 2.0   標準差倍數（上下軌距）
+#   squeeze_percentile 預設 20    帶寬低於歷史此百分位才視為擠壓
+# ─────────────────────────────────────────────
+
+def check_bollinger_squeeze_breakout(
+    df: pd.DataFrame,
+    period: int = 20,
+    std_dev: float = 2.0,
+    squeeze_percentile: int = 20,
+) -> Optional[Dict[str, Any]]:
+    """判斷股票是否符合「布林通道擠壓突破」條件。"""
+    required_cols = {"open", "high", "low", "close", "volume", "date"}
+    if not required_cols.issubset(df.columns):
+        return None
+    if len(df) < period + 30:  # 需要足夠歷史資料計算百分位
+        return None
+
+    df = df.copy()
+    rolling        = df["close"].rolling(period)
+    df["_bb_mid"]  = rolling.mean()
+    rolling_std    = rolling.std()
+    df["_bb_upper"] = df["_bb_mid"] + std_dev * rolling_std
+    df["_bb_width"] = (std_dev * 2 * rolling_std) / df["_bb_mid"]
+
+    today = df.iloc[-1]
+    prev  = df.iloc[-2]
+
+    if pd.isna(today["_bb_upper"]) or pd.isna(prev["_bb_width"]):
+        return None
+
+    close    = float(today["close"])
+    bb_upper = float(today["_bb_upper"])
+    bb_mid   = float(today["_bb_mid"])
+
+    # 今日收盤需突破布林上軌
+    if close <= bb_upper:
+        return None
+
+    # 昨日帶寬需處於歷史低百分位（擠壓狀態）
+    hist_widths   = df["_bb_width"].dropna()
+    prev_width    = float(prev["_bb_width"])
+    width_pct_rank = float((hist_widths <= prev_width).mean() * 100)
+    if width_pct_rank > squeeze_percentile:
+        return None
+
+    return {
+        "日期":          pd.Timestamp(today["date"]).strftime("%Y-%m-%d"),
+        "收盤價":        round(close, 2),
+        "布林上軌":      round(bb_upper, 2),
+        "布林中軌":      round(bb_mid, 2),
+        "突破幅度(%)":   round((close - bb_upper) / bb_upper * 100, 2),
+        "帶寬百分位(%)": round(width_pct_rank, 1),
+        "成交量":        int(today["volume"]),
+    }
+
+
 # ═════════════════════════════════════════════
 # 通用批次掃描引擎
 # ═════════════════════════════════════════════
@@ -408,6 +518,50 @@ def _render_oversold_reversal_params() -> Tuple[Callable, int, str]:
     return lambda df: check_oversold_reversal(df, bpct, sr), 30, info
 
 
+def _render_52week_params() -> Tuple[Callable, int, str]:
+    """52 週高點突破：渲染參數控制項。"""
+    vol_ratio = st.slider(
+        "量能確認倍數", min_value=1.0, max_value=3.0, value=1.3, step=0.1,
+        help="今日成交量需大於近 5 日均量的幾倍，預設 1.3",
+        key="sc_52w_vol",
+    )
+    vr = float(vol_ratio)
+    info = (
+        "- **52週高點**：今日收盤 > 前 252 個交易日最高收盤價\n"
+        f"- **量能確認**：今日量 > 5 日均量 × {vr:.1f} 倍\n"
+        "- 動能加速訊號，配合趨勢順勢使用效果更佳"
+    )
+    return lambda df: check_52week_high_breakout(df, vr), 270, info
+
+
+def _render_bb_squeeze_params() -> Tuple[Callable, int, str]:
+    """布林通道擠壓突破：渲染參數控制項。"""
+    period = st.number_input(
+        "布林週期", min_value=10, max_value=60, value=20, step=1,
+        help="計算布林通道使用的天數，預設 20",
+        key="sc_bb_period",
+    )
+    squeeze_pct = st.slider(
+        "擠壓百分位（%）", min_value=5, max_value=40, value=20, step=5,
+        help="昨日帶寬低於歷史此百分位，才視為擠壓狀態",
+        key="sc_bb_squeeze",
+    )
+    std_dev = st.select_slider(
+        "標準差倍數（σ）", options=[1.5, 2.0, 2.5, 3.0], value=2.0,
+        help="布林通道寬度（標準差倍數），預設 2.0",
+        key="sc_bb_std",
+    )
+    p  = int(period)
+    sp = int(squeeze_pct)
+    sd = float(std_dev)
+    info = (
+        f"- **布林擠壓**：昨日帶寬低於歷史 {sp}% 百分位\n"
+        f"- **突破上軌**：今日收盤 > 布林上軌（{sd:.1f}σ，週期 {p}）\n"
+        "- 擠壓後方向性突破通常伴隨較強走勢"
+    )
+    return lambda df: check_bollinger_squeeze_breakout(df, p, sd, sp), p + 50, info
+
+
 # ─────────────────────────────────────────────
 # 策略登記表（新增策略時擴充此處即可）
 # ─────────────────────────────────────────────
@@ -416,6 +570,8 @@ STRATEGY_REGISTRY: Dict[str, Callable] = {
     "均線多頭排列":      _render_ma_alignment_params,
     "爆量長紅起漲":      _render_volume_surge_params,
     "乖離過大跌深反彈":  _render_oversold_reversal_params,
+    "52週高點突破":      _render_52week_params,
+    "布林擠壓突破":      _render_bb_squeeze_params,
 }
 
 NO_RESULT_HINTS: Dict[str, str] = {
@@ -423,6 +579,8 @@ NO_RESULT_HINTS: Dict[str, str] = {
     "均線多頭排列":      "可嘗試：確認觀察清單中有趨勢向上的股票，或待多頭排列形成後再掃描。",
     "爆量長紅起漲":      "可嘗試：降低爆量倍數或 K 棒漲幅門檻後重新掃描。",
     "乖離過大跌深反彈":  "可嘗試：將負乖離門檻放寬（例如 -8%）或降低下影線比例。",
+    "52週高點突破":      "可嘗試：降低量能確認倍數，或確認觀察清單標的歷史資料足夠（需 253 個交易日以上）。",
+    "布林擠壓突破":      "可嘗試：放寬擠壓百分位（例如 30%）或縮短布林週期後重新掃描。",
 }
 
 

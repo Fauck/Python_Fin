@@ -30,6 +30,12 @@ from financial_translations import STMT_INDEX_ZH as _STMT_INDEX_ZH
 # ── 台股純數字代號識別（4~6 位）
 _TW_CODE_RE = re.compile(r"^\d{4,6}$")
 
+# ── 財務診斷預設門檻（UI 進階面板未調整時使用）
+_DEFAULT_TARGET_REVENUE_GROWTH: float = 10.0   # 目標營收成長率 (%)
+_DEFAULT_TARGET_GROSS_MARGIN:   float = 20.0   # 目標毛利率低標 (%)
+_DEFAULT_TARGET_NET_MARGIN:     float = 10.0   # 目標淨利率低標 (%)
+_DEFAULT_TARGET_DIV_YIELD:      float = 5.0    # 目標現金殖利率 (%)（保留供外部整合）
+
 
 # ═════════════════════════════════════════════
 # 資料層：財報抓取
@@ -270,19 +276,27 @@ def _extract_key_metrics(df_income: pd.DataFrame) -> Optional[pd.DataFrame]:
     return df
 
 
-def generate_financial_advice(df: pd.DataFrame) -> Dict[str, str]:
+def generate_financial_advice(
+    df: pd.DataFrame,
+    target_revenue_growth: float = _DEFAULT_TARGET_REVENUE_GROWTH,
+    target_gross_margin:   float = _DEFAULT_TARGET_GROSS_MARGIN,
+    target_net_margin:     float = _DEFAULT_TARGET_NET_MARGIN,
+) -> Dict[str, str]:
     """
-    基於最近兩期財務數據給出量化投資診斷。
+    基於最新一期財務數據與使用者自訂門檻給出量化投資診斷。
 
     診斷面向
     --------
-    1. 獲利能力（雙率雙升）：毛利率 + 淨利率同步提升 → 🟢
-    2. 營收動能：年增率 >10% 🟢 / -5%~10% 🟡 / <-5% 🔴
-    3. 綜合評級：四種情境對應不同操作建議
+    1. 獲利能力達標判定：最新毛利率 / 淨利率 vs 使用者設定低標
+    2. 營收動能判定：最新營收成長率 vs 使用者設定目標
+    3. 綜合評級：依兩個面向的達標組合給出四種結論
 
     Parameters
     ----------
-    df : _extract_key_metrics 回傳的升冪 DataFrame（至少 2 列）
+    df                    : _extract_key_metrics 回傳的升冪 DataFrame（至少 2 列）
+    target_revenue_growth : 目標營收成長率下限（%），預設 10.0
+    target_gross_margin   : 目標毛利率低標（%），預設 20.0
+    target_net_margin     : 目標淨利率低標（%），預設 10.0
 
     Returns
     -------
@@ -298,62 +312,76 @@ def generate_financial_advice(df: pd.DataFrame) -> Dict[str, str]:
         return _na
 
     latest = df.iloc[-1]
-    prev   = df.iloc[-2]
 
-    # ── 1. 獲利能力（雙率雙升）────────────────────
+    # ── 1. 獲利能力達標判定 ───────────────────────
     gm_l = float(latest["gross_margin"])
     nm_l = float(latest["net_margin"])
-    gm_p = float(prev["gross_margin"])
-    nm_p = float(prev["net_margin"])
 
-    if any(pd.isna(v) for v in [gm_l, nm_l, gm_p, nm_p]):
+    if pd.isna(gm_l) or pd.isna(nm_l):
         margin_signal = "🔘 毛利率或淨利率資料不完整，無法判斷"
-        double_up = False
-    elif gm_l > gm_p and nm_l > nm_p:
+        margin_ok = False
+    elif gm_l >= target_gross_margin and nm_l >= target_net_margin:
         margin_signal = (
-            f"🟢 雙率雙升：毛利率 {gm_p:.1f}% → {gm_l:.1f}%，"
-            f"淨利率 {nm_p:.1f}% → {nm_l:.1f}%，獲利能力轉強"
+            f"🟢 獲利能力達標：毛利率 {gm_l:.1f}%（目標 ≥{target_gross_margin:.1f}%）、"
+            f"淨利率 {nm_l:.1f}%（目標 ≥{target_net_margin:.1f}%），符合您設定的利潤標準"
         )
-        double_up = True
-    elif gm_l > gm_p or nm_l > nm_p:
-        which = "毛利率" if gm_l > gm_p else "淨利率"
-        margin_signal = f"🟡 單率上升：{which}改善，另一項指標持平或下滑"
-        double_up = False
+        margin_ok = True
+    elif gm_l >= target_gross_margin:
+        margin_signal = (
+            f"🟡 部分達標：毛利率 {gm_l:.1f}% 達標，"
+            f"但淨利率 {nm_l:.1f}%（目標 ≥{target_net_margin:.1f}%）未達標"
+        )
+        margin_ok = False
+    elif nm_l >= target_net_margin:
+        margin_signal = (
+            f"🟡 部分達標：淨利率 {nm_l:.1f}% 達標，"
+            f"但毛利率 {gm_l:.1f}%（目標 ≥{target_gross_margin:.1f}%）未達標"
+        )
+        margin_ok = False
     else:
         margin_signal = (
-            f"🔴 雙率收斂：毛利率 {gm_p:.1f}% → {gm_l:.1f}%，"
-            f"淨利率 {nm_p:.1f}% → {nm_l:.1f}%，獲利能力承壓"
+            f"🔴 獲利能力未達標：毛利率 {gm_l:.1f}%（目標 ≥{target_gross_margin:.1f}%）、"
+            f"淨利率 {nm_l:.1f}%（目標 ≥{target_net_margin:.1f}%）均未達標"
         )
-        double_up = False
+        margin_ok = False
 
-    # ── 2. 營收動能 ───────────────────────────────
+    # ── 2. 營收動能判定 ───────────────────────────
     growth = float(latest["revenue_growth"])
     if pd.isna(growth):
         growth_signal = "🔘 營收成長率資料不足"
-        growth_strong = False
-    elif growth > 10:
-        growth_signal = f"🟢 營收強勁成長（{growth:.1f}%），具備成長動能"
-        growth_strong = True
-    elif growth >= -5:
-        growth_signal = f"🟡 營收動能平穩（{growth:.1f}%），維持現狀"
-        growth_strong = False
+        growth_ok = False
+    elif growth >= target_revenue_growth:
+        growth_signal = (
+            f"🟢 營收動能強勁：成長率 {growth:.1f}%，超越預期目標"
+            f"（≥{target_revenue_growth:.1f}%）"
+        )
+        growth_ok = True
+    elif growth > 0:
+        growth_signal = (
+            f"🟡 營收正成長但未達標：成長率 {growth:.1f}%"
+            f"（目標 ≥{target_revenue_growth:.1f}%）"
+        )
+        growth_ok = False
     else:
-        growth_signal = f"🔴 營收年減（{growth:.1f}%），面臨衰退壓力"
-        growth_strong = False
+        growth_signal = (
+            f"🔴 營收衰退：成長率 {growth:.1f}%"
+            f"（目標 ≥{target_revenue_growth:.1f}%）"
+        )
+        growth_ok = False
 
     # ── 3. 綜合評級 ───────────────────────────────
-    if growth_strong and double_up:
-        overall = "🌟 基本面強勢：營收與獲利雙重改善，適合長線偏多看待"
-        detail  = "企業具備定價能力與規模效益，可列入長線觀察。"
-    elif growth_strong and not double_up:
-        overall = "⚠️ 留意做白工風險：營收成長但獲利率遭壓縮"
-        detail  = "成長品質存疑，需關注毛利率變化趨勢；可短線操作，長線需謹慎。"
-    elif not growth_strong and double_up:
-        overall = "🟡 獲利效率改善，但營收動能不足"
-        detail  = "企業正在改善成本結構，頂線成長待觀察，可追蹤下季動向。"
+    if margin_ok and growth_ok:
+        overall = "🌟 全面達標：獲利能力與成長動能均符合目標，基本面優質"
+        detail  = "企業各項財務指標均符合您設定的標準，可列入重點追蹤清單。"
+    elif growth_ok and not margin_ok:
+        overall = "⚠️ 成長達標但獲利品質不足：留意做白工風險"
+        detail  = "營收持續成長，但獲利率未達標準；需關注成本控制與定價能力。"
+    elif margin_ok and not growth_ok:
+        overall = "🟡 獲利穩健但成長趨緩：適合等待營收動能回升"
+        detail  = "企業保有良好利潤水準，但頂線成長未達預期；可持續觀察下季動向。"
     else:
-        overall = "🚨 基本面轉弱：營收與獲利同步下滑，建議觀望或保守操作"
-        detail  = "需等待基本面反轉訊號再介入。"
+        overall = "🚨 全面未達標：獲利能力與成長動能均低於目標，基本面偏弱"
+        detail  = "建議觀望，待財務指標回升至目標水準後再考慮介入。"
 
     return {
         "margin_signal": margin_signal,
@@ -507,14 +535,20 @@ def build_combo_chart(
 def analyze_financials(
     symbol: str,
     quarterly: bool = False,
+    target_revenue_growth: float = _DEFAULT_TARGET_REVENUE_GROWTH,
+    target_gross_margin:   float = _DEFAULT_TARGET_GROSS_MARGIN,
+    target_net_margin:     float = _DEFAULT_TARGET_NET_MARGIN,
 ) -> Optional[Dict[str, Any]]:
     """
     主要外部函式：取得財務報表並執行關鍵指標分析。
 
     Parameters
     ----------
-    symbol    : 股票代號（台股 4-6 位數字 / 美股英文）
-    quarterly : True → 季報；False（預設）→ 年報
+    symbol                : 股票代號（台股 4-6 位數字 / 美股英文）
+    quarterly             : True → 季報；False（預設）→ 年報
+    target_revenue_growth : 目標營收成長率下限（%），預設 10.0
+    target_gross_margin   : 目標毛利率低標（%），預設 20.0
+    target_net_margin     : 目標淨利率低標（%），預設 10.0
 
     Returns
     -------
@@ -524,6 +558,7 @@ def analyze_financials(
         "chart":  go.Figure,   # 雙軸組合圖
         "advice": dict,        # generate_financial_advice 回傳值
         "is_tw":  bool,
+        "thresholds": dict,    # 實際使用的門檻值（供 UI 顯示確認）
     }
     或 None（損益表資料不足無法分析）
 
@@ -531,7 +566,16 @@ def analyze_financials(
     -----------
     from financial_report import analyze_financials
 
+    # 使用預設門檻
     result = analyze_financials("2330")
+
+    # 使用自訂門檻
+    result = analyze_financials(
+        "2330",
+        target_revenue_growth=15.0,
+        target_gross_margin=30.0,
+        target_net_margin=15.0,
+    )
     if result:
         st.plotly_chart(result["chart"])
         st.write(result["advice"]["overall"])
@@ -551,8 +595,18 @@ def analyze_financials(
         "symbol": resolved,
         "df":     metrics_df,
         "chart":  build_combo_chart(metrics_df, is_tw=is_tw, symbol=resolved),
-        "advice": generate_financial_advice(metrics_df),
+        "advice": generate_financial_advice(
+            metrics_df,
+            target_revenue_growth=target_revenue_growth,
+            target_gross_margin=target_gross_margin,
+            target_net_margin=target_net_margin,
+        ),
         "is_tw":  is_tw,
+        "thresholds": {
+            "revenue_growth": target_revenue_growth,
+            "gross_margin":   target_gross_margin,
+            "net_margin":     target_net_margin,
+        },
     }
 
 
@@ -584,6 +638,51 @@ def render_financial_page() -> None:
             key="fin_period",
         )
         quarterly = period == "季報"
+
+        # ── 進階財務診斷參數設定（折疊，預設值可直接使用）
+        with st.expander("⚙️ 進階財務診斷參數設定", expanded=False):
+            st.caption("未調整時使用預設值，修改後點擊「查詢財報」生效。")
+            target_revenue_growth: float = st.number_input(
+                "目標營收成長率 (%)",
+                min_value=-100.0,
+                max_value=1000.0,
+                value=_DEFAULT_TARGET_REVENUE_GROWTH,
+                step=1.0,
+                format="%.1f",
+                key="fin_target_rev_growth",
+                help="最新一期年增率 ≥ 此值視為「強勁成長」（預設 10%）",
+            )
+            target_gross_margin: float = st.number_input(
+                "目標毛利率低標 (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=_DEFAULT_TARGET_GROSS_MARGIN,
+                step=1.0,
+                format="%.1f",
+                key="fin_target_gm",
+                help="最新一期毛利率 ≥ 此值視為「獲利能力合格」（預設 20%）",
+            )
+            target_net_margin: float = st.number_input(
+                "目標淨利率低標 (%)",
+                min_value=-100.0,
+                max_value=100.0,
+                value=_DEFAULT_TARGET_NET_MARGIN,
+                step=1.0,
+                format="%.1f",
+                key="fin_target_nm",
+                help="最新一期淨利率 ≥ 此值視為「盈利能力合格」（預設 10%）",
+            )
+            st.number_input(
+                "目標現金殖利率 (%)",
+                min_value=0.0,
+                max_value=50.0,
+                value=_DEFAULT_TARGET_DIV_YIELD,
+                step=0.5,
+                format="%.1f",
+                key="fin_target_div_yield",
+                help="保留欄位，供未來串接殖利率資料時使用（預設 5%）",
+                disabled=True,
+            )
 
         query_btn = st.button(
             "查詢財報", type="primary", use_container_width=True,
@@ -667,7 +766,13 @@ def render_financial_page() -> None:
 
         with st.spinner("正在計算財務指標…"):
             try:
-                analysis = analyze_financials(raw_symbol, quarterly=quarterly)
+                analysis = analyze_financials(
+                    raw_symbol,
+                    quarterly=quarterly,
+                    target_revenue_growth=target_revenue_growth,
+                    target_gross_margin=target_gross_margin,
+                    target_net_margin=target_net_margin,
+                )
             except Exception:
                 analysis = None
 
@@ -681,12 +786,19 @@ def render_financial_page() -> None:
 
             # 投資診斷訊號
             advice = analysis["advice"]
+            thr    = analysis["thresholds"]
+            st.caption(
+                f"診斷標準 ── 營收成長目標：{thr['revenue_growth']:.1f}%　｜　"
+                f"毛利率低標：{thr['gross_margin']:.1f}%　｜　"
+                f"淨利率低標：{thr['net_margin']:.1f}%"
+            )
+
             col_a, col_b = st.columns(2)
             with col_a:
-                st.markdown("**獲利能力（雙率雙升判斷）**")
+                st.markdown("**獲利能力達標判定**")
                 st.markdown(advice["margin_signal"])
             with col_b:
-                st.markdown("**營收動能**")
+                st.markdown("**營收動能判定**")
                 st.markdown(advice["growth_signal"])
 
             st.markdown(f"**綜合評級：** {advice['overall']}")

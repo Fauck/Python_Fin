@@ -142,6 +142,61 @@ def compute_ma(df: pd.DataFrame, periods: List[int]) -> pd.DataFrame:
     return df
 
 
+def compute_bollinger(
+    df: pd.DataFrame,
+    period: int = 20,
+    std_dev: float = 2.0,
+) -> pd.DataFrame:
+    """
+    計算布林通道（Bollinger Bands）。
+
+    Parameters
+    ----------
+    df      : 含 close 欄位的 DataFrame
+    period  : 計算週期（預設 20）
+    std_dev : 標準差倍數（預設 2.0）
+
+    Returns
+    -------
+    含 bb_mid / bb_upper / bb_lower / bb_width 新欄位的 DataFrame 副本
+    bb_width = (bb_upper - bb_lower) / bb_mid（帶寬，越小表示越擠壓）
+    """
+    df = df.copy()
+    rolling        = df["close"].rolling(period)
+    df["bb_mid"]   = rolling.mean()
+    df["bb_upper"] = df["bb_mid"] + std_dev * rolling.std()
+    df["bb_lower"] = df["bb_mid"] - std_dev * rolling.std()
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
+    return df
+
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """
+    計算平均真實範圍（ATR, Average True Range）。
+
+    公式：
+      TR  = max(High − Low,  |High − PrevClose|,  |Low − PrevClose|)
+      ATR = EWM(TR, α = 1/period)  （Wilder 平滑法）
+
+    Parameters
+    ----------
+    df     : 含 high / low / close 欄位的 DataFrame（日期升冪）
+    period : ATR 計算週期，預設 14
+
+    Returns
+    -------
+    含 atr 新欄位的 DataFrame 副本
+    """
+    df = df.copy()
+    prev_close = df["close"].shift(1)
+    high_low   = df["high"] - df["low"]
+    high_prev  = (df["high"] - prev_close).abs()
+    low_prev   = (df["low"]  - prev_close).abs()
+    tr         = pd.concat([high_low, high_prev, low_prev], axis=1).max(axis=1)
+    df["atr"]  = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    return df
+
+
 def compute_kd(df: pd.DataFrame, period: int = 9) -> pd.DataFrame:
     """
     計算台灣市場標準 KD 指標（隨機指標）。
@@ -176,4 +231,78 @@ def compute_kd(df: pd.DataFrame, period: int = 9) -> pd.DataFrame:
 
     df["k_val"] = [round(v, 2) for v in k_vals]
     df["d_val"] = [round(v, 2) for v in d_vals]
+    return df
+
+
+def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """
+    計算相對強弱指標（RSI, Relative Strength Index）。
+
+    公式（Wilder 平滑，與 TradingView 一致）：
+      Delta  = Close(t) − Close(t-1)
+      Gain   = Delta.clip(0)
+      Loss   = (−Delta).clip(0)
+      AvgG   = EWM(Gain, α = 1/period, adjust=False)
+      AvgL   = EWM(Loss, α = 1/period, adjust=False)
+      RSI    = 100 − 100 / (1 + AvgG / AvgL)
+
+    Parameters
+    ----------
+    df     : 含 close 欄位的 DataFrame（日期升冪）
+    period : RSI 計算週期，預設 14
+
+    Returns
+    -------
+    含 rsi_14（或 rsi_{period}）新欄位的 DataFrame 副本
+    """
+    df    = df.copy()
+    delta = df["close"].diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+
+    alpha    = 1.0 / period
+    avg_gain = gain.ewm(alpha=alpha, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=alpha, adjust=False).mean()
+
+    rs  = avg_gain / avg_loss.replace(0, float("inf"))
+    rsi = (100.0 - 100.0 / (1.0 + rs)).clip(0, 100).round(2)
+
+    col_name      = f"rsi_{period}" if period != 14 else "rsi_14"
+    df[col_name]  = rsi
+    return df
+
+
+def compute_macd(
+    df: pd.DataFrame,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> pd.DataFrame:
+    """
+    計算 MACD 指標（DIF / DEA / Histogram）。
+
+    公式：
+      EMA_fast   = EMA(Close, fast)
+      EMA_slow   = EMA(Close, slow)
+      MACD line  = EMA_fast − EMA_slow       （DIF）
+      Signal     = EMA(MACD line, signal)    （DEA）
+      Histogram  = MACD line − Signal
+
+    Parameters
+    ----------
+    df     : 含 close 欄位的 DataFrame（日期升冪）
+    fast   : 快線 EMA 週期（預設 12）
+    slow   : 慢線 EMA 週期（預設 26）
+    signal : 訊號線 EMA 週期（預設 9）
+
+    Returns
+    -------
+    含 macd_line / macd_signal / macd_hist 新欄位的 DataFrame 副本
+    """
+    df               = df.copy()
+    ema_fast         = df["close"].ewm(span=fast,   adjust=False).mean()
+    ema_slow         = df["close"].ewm(span=slow,   adjust=False).mean()
+    df["macd_line"]   = (ema_fast - ema_slow).round(4)
+    df["macd_signal"] = df["macd_line"].ewm(span=signal, adjust=False).mean().round(4)
+    df["macd_hist"]   = (df["macd_line"] - df["macd_signal"]).round(4)
     return df

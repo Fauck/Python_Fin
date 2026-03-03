@@ -11,7 +11,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from utils import fetch_stock_candles, compute_ma, compute_kd
+from utils import (
+    fetch_stock_candles,
+    compute_ma, compute_kd,
+    compute_bollinger, compute_rsi, compute_macd,
+)
 
 
 # ═════════════════════════════════════════════
@@ -144,6 +148,184 @@ def calculate_deduction_values(
 
 
 # ═════════════════════════════════════════════
+# 演算法層：進場訊號評分
+# ═════════════════════════════════════════════
+
+def _sf(val) -> Optional[float]:
+    """安全轉型：無法取得或 NaN 時回傳 None。"""
+    try:
+        f = float(val)
+        return None if pd.isna(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+def analyze_entry_signal(df_full: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    分析最新交易日進場適合度（技術面多維評分）。
+
+    評分維度與權重
+    ──────────────
+    趨勢 (35 分)：收盤站上 MA20 (15)、均線多頭排列 (15)、站上 MA5 (5)
+    動能 (35 分)：RSI(14) 狀態 (15)、MACD 柱狀正 (10)、KD K>D (10)
+    波動 (10 分)：布林通道位置 (10)
+    量能 (10 分)：成交量確認 (10)
+
+    Returns
+    -------
+    None（資料不足）或 dict {
+        signal:    str   —「強力進場」/「偏多觀察」/「偏空觀望」/「謹慎避開」
+        color:     str   — CSS 色碼
+        score_pct: float — 得分百分比 (0~100)
+        total_pts: int
+        max_pts:   int
+        checks:    List[Dict] — 每項明細
+        close:     float
+        date:      str
+    }
+    """
+    if df_full is None or len(df_full) < 30:
+        return None
+
+    df = df_full.copy()
+
+    # 確保所有指標已計算（不重複計算已存在的欄位）
+    if "ma5" not in df.columns:
+        df = compute_ma(df, [5, 10, 20])
+    if "k_val" not in df.columns:
+        df = compute_kd(df)
+    if "rsi_14" not in df.columns:
+        df = compute_rsi(df)
+    if "macd_hist" not in df.columns:
+        df = compute_macd(df)
+    if "bb_mid" not in df.columns:
+        df = compute_bollinger(df)
+
+    r     = df.iloc[-1]
+    close = _sf(r.get("close"))
+    if close is None:
+        return None
+
+    checks: List[Dict[str, Any]] = []
+    total_pts = 0
+    max_pts   = 0
+
+    def add(cat: str, name: str, ok: bool, pts: int, max_p: int, detail: str) -> None:
+        nonlocal total_pts, max_pts
+        checks.append({"cat": cat, "name": name, "ok": ok,
+                        "pts": pts, "max_pts": max_p, "detail": detail})
+        total_pts += pts
+        max_pts   += max_p
+
+    # ── 趨勢 ─────────────────────────────────
+    ma20 = _sf(r.get("ma20"))
+    ma10 = _sf(r.get("ma10"))
+    ma5  = _sf(r.get("ma5"))
+
+    if ma20 is not None:
+        ok = close > ma20
+        add("📐 趨勢", "收盤站上月線 MA20",
+            ok, 15 if ok else 0, 15,
+            f"收盤 {close:.2f} {'> ↑ 多頭' if ok else '< ↓ 空頭'} MA20 {ma20:.2f}")
+
+    if all(x is not None for x in [ma5, ma10, ma20]):
+        ok = (ma5 > ma10 > ma20)  # type: ignore[operator]
+        add("📐 趨勢", "均線多頭排列 (MA5>MA10>MA20)",
+            ok, 15 if ok else 0, 15,
+            f"MA5 {ma5:.1f} {'>' if ma5>ma10 else '≤'} MA10 {ma10:.1f} {'>' if ma10>ma20 else '≤'} MA20 {ma20:.1f}")  # type: ignore[operator]
+
+    if ma5 is not None:
+        ok = close > ma5
+        add("📐 趨勢", "收盤站上短均線 MA5",
+            ok, 5 if ok else 0, 5,
+            f"收盤 {close:.2f} {'> MA5' if ok else '< MA5'} {ma5:.2f}")
+
+    # ── 動能 ─────────────────────────────────
+    rsi = _sf(r.get("rsi_14"))
+    if rsi is not None:
+        if 40 <= rsi <= 70:
+            pts, ok, msg = 15, True,  f"RSI {rsi:.1f} — 健康動能區間 (40~70)"
+        elif rsi < 30:
+            pts, ok, msg = 8,  True,  f"RSI {rsi:.1f} — 超賣，可能反彈"
+        elif 30 <= rsi < 40 or 70 < rsi <= 80:
+            pts, ok, msg = 5,  False, f"RSI {rsi:.1f} — 邊界區間，待確認"
+        else:
+            pts, ok, msg = 0,  False, f"RSI {rsi:.1f} — 超買過熱 (>80)，謹慎"
+        add("⚡ 動能", "RSI(14) 動能狀態", ok, pts, 15, msg)
+
+    macd_hist   = _sf(r.get("macd_hist"))
+    macd_line   = _sf(r.get("macd_line"))
+    macd_signal = _sf(r.get("macd_signal"))
+    if macd_hist is not None:
+        ok = macd_hist > 0
+        cross = ""
+        if macd_line is not None and macd_signal is not None:
+            cross = f"，DIF {macd_line:+.3f} / DEA {macd_signal:+.3f}"
+        add("⚡ 動能", "MACD 柱狀圖方向",
+            ok, 10 if ok else 0, 10,
+            f"直方圖 {macd_hist:+.3f}（{'多頭擴張 ↑' if ok else '空頭收縮 ↓'}）{cross}")
+
+    k_val = _sf(r.get("k_val"))
+    d_val = _sf(r.get("d_val"))
+    if k_val is not None and d_val is not None:
+        ok = k_val > d_val
+        add("⚡ 動能", "KD 黃金 / 死亡交叉",
+            ok, 10 if ok else 0, 10,
+            f"K = {k_val:.1f}，D = {d_val:.1f}（{'K > D 多頭' if ok else 'K < D 空頭'}）")
+
+    # ── 波動 (布林) ───────────────────────────
+    bb_mid   = _sf(r.get("bb_mid"))
+    bb_upper = _sf(r.get("bb_upper"))
+    bb_lower = _sf(r.get("bb_lower"))
+    if bb_mid is not None and bb_upper is not None:
+        if close >= bb_upper:
+            pts, ok, msg = 3, False, f"突破上軌 {bb_upper:.2f}，注意超買"
+        elif close > bb_mid:
+            pts, ok, msg = 10, True,  f"中軌 {bb_mid:.2f} 上方，布林多頭區"
+        else:
+            ll = f"，近下軌 {bb_lower:.2f}" if bb_lower is not None else ""
+            pts, ok, msg = 0, False, f"中軌 {bb_mid:.2f} 下方，布林空頭區{ll}"
+        add("📊 波動", "布林通道位置", ok, pts, 10, msg)
+
+    # ── 量能 ─────────────────────────────────
+    vol_today = _sf(r.get("volume"))
+    if vol_today is not None and len(df) >= 6:
+        avg5 = float(df["volume"].iloc[-6:-1].mean())
+        if avg5 > 0:
+            ratio = vol_today / avg5
+            if ratio >= 1.5:
+                pts, ok, msg = 10, True, f"量比 {ratio:.2f}x — 爆量，買盤強勁"
+            elif ratio >= 1.0:
+                pts, ok, msg = 5, True,  f"量比 {ratio:.2f}x — 溫和放量"
+            else:
+                pts, ok, msg = 0, False, f"量比 {ratio:.2f}x — 縮量，注意觀望"
+            add("📦 量能", "今日量 vs 5日均量", ok, pts, 10, msg)
+
+    # ── 信號評級 ─────────────────────────────
+    pct = total_pts / max_pts * 100 if max_pts > 0 else 0
+
+    if pct >= 70:
+        signal, color = "強力進場", "#2E7D32"
+    elif pct >= 50:
+        signal, color = "偏多觀察", "#F57F17"
+    elif pct >= 30:
+        signal, color = "偏空觀望", "#E65100"
+    else:
+        signal, color = "謹慎避開", "#B71C1C"
+
+    return {
+        "signal":    signal,
+        "color":     color,
+        "score_pct": round(pct, 1),
+        "total_pts": total_pts,
+        "max_pts":   max_pts,
+        "checks":    checks,
+        "close":     close,
+        "date":      str(df_full.iloc[-1]["date"])[:10],
+    }
+
+
+# ═════════════════════════════════════════════
 # 展示層：均線扣抵值儀表板
 # ═════════════════════════════════════════════
 
@@ -202,6 +384,95 @@ def render_deduction_section(
         for d in deduction_data
     ]
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+
+# ═════════════════════════════════════════════
+# 展示層：進場訊號卡片
+# ═════════════════════════════════════════════
+
+def render_entry_signal(result: Dict[str, Any], symbol: str) -> None:
+    """渲染進場訊號分析卡片（信號徽章 + 分項明細）。"""
+    from collections import defaultdict
+
+    st.markdown("---")
+    st.subheader(f"🎯 {symbol} 進場訊號分析")
+
+    col_badge, col_checks = st.columns([1, 2], gap="large")
+
+    with col_badge:
+        color  = result["color"]
+        signal = result["signal"]
+        pct    = result["score_pct"]
+        total  = result["total_pts"]
+        mx     = result["max_pts"]
+        date_  = result["date"]
+        close_ = result["close"]
+
+        # 信號徽章
+        st.markdown(f"""
+<div style="
+  border:2px solid {color};
+  border-radius:14px;
+  padding:22px 16px;
+  text-align:center;
+  background:{color}18;
+">
+  <div style="font-size:12px;color:#888;margin-bottom:4px;">{date_} 收盤</div>
+  <div style="font-size:36px;font-weight:800;color:{color};line-height:1.2;">{signal}</div>
+  <div style="font-size:22px;font-weight:600;color:#333;margin:10px 0 6px;">
+    {close_:,.2f}
+  </div>
+  <div style="font-size:12px;color:#666;">
+    技術評分 {total} / {mx} 分
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # 進度條 + 百分比標籤
+        st.caption(f"綜合達標率：{pct:.1f}%")
+        st.progress(int(pct) / 100)
+
+        # 信號說明
+        tips = {
+            "強力進場": "技術面多頭格局明確，量能配合，可考慮進場佈局。",
+            "偏多觀察": "多頭趨勢初現，但部分指標尚未完全確認，可少量試單。",
+            "偏空觀望": "趨勢偏弱或指標分歧，建議觀望待訊號更明朗。",
+            "謹慎避開": "多項技術指標偏空，進場風險較高，建議暫時迴避。",
+        }
+        st.caption(tips.get(signal, ""))
+
+    with col_checks:
+        # 依類別分組顯示
+        cat_groups: Dict[str, List] = defaultdict(list)
+        for c in result["checks"]:
+            cat_groups[c["cat"]].append(c)
+
+        for cat, items in cat_groups.items():
+            cat_pts = sum(i["pts"] for i in items)
+            cat_max = sum(i["max_pts"] for i in items)
+            pct_bar = cat_pts / cat_max if cat_max > 0 else 0
+
+            # 類別標題 + 分數
+            st.markdown(
+                f"**{cat}** &nbsp;"
+                f"<span style='color:#888;font-size:12px;'>{cat_pts} / {cat_max} 分</span>",
+                unsafe_allow_html=True,
+            )
+
+            for item in items:
+                icon = "✅" if item["ok"] else "❌"
+                st.markdown(
+                    f"{icon} **{item['name']}**  \n"
+                    f"<span style='color:#666;font-size:12px;margin-left:20px;'>"
+                    f"{item['detail']}</span>",
+                    unsafe_allow_html=True,
+                )
+
+            # 類別進度條
+            st.progress(pct_bar)
+            st.markdown("")
 
 
 # ═════════════════════════════════════════════
@@ -278,22 +549,28 @@ def render_ohlcv_chart(
     symbol: str,
     show_ma: Optional[List[int]] = None,
     show_kd: bool = False,
+    show_bb: bool = False,
+    show_rsi: bool = False,
+    show_macd: bool = False,
 ) -> None:
     """
-    繪製 K 線 + 均線 + 成交量 + 成交值 + KD 子圖（Plotly subplots）。
+    繪製 K 線 + 均線 + 布林 + 成交量 + 成交值 + KD / RSI / MACD 子圖。
 
     子圖結構（依資料與參數動態決定）：
-      Row 1：K 線圖 + MA 均線覆蓋（Candlestick + Scatter）
-      Row 2：成交量柱狀圖（依漲跌著色，若有資料）
+      Row 1：K 線圖 + MA 均線覆蓋 + 布林通道（選用）
+      Row 2：成交量柱狀圖（若有資料）
       Row 3：成交值柱狀圖（若有資料）
-      Row N：KD 值折線圖（若啟用）
+      Row N：KD / RSI / MACD（依啟用順序）
 
     Parameters
     ----------
-    df      : 含 OHLCV 欄位的 DataFrame；若已含 ma5/ma10/ma20/k_val/d_val 則直接使用
-    symbol  : 股票代號
-    show_ma : 要顯示的均線天數清單，例如 [5, 10, 20]；None 表示不顯示
-    show_kd : 是否顯示 KD 子圖
+    df        : 含 OHLCV 欄位的 DataFrame；若已含均線/指標欄位則直接使用
+    symbol    : 股票代號
+    show_ma   : 要顯示的均線天數清單，例如 [5, 10, 20]；None 表示不顯示
+    show_kd   : 是否顯示 KD 子圖
+    show_bb   : 是否在 K 線圖上疊加布林通道
+    show_rsi  : 是否顯示 RSI(14) 子圖
+    show_macd : 是否顯示 MACD 子圖
     """
     required = {"open", "high", "low", "close", "date"}
     if not required.issubset(df.columns):
@@ -308,13 +585,17 @@ def render_ohlcv_chart(
 
     # ── 動態建立子圖列表 ─────────────────────────
     # 每個 dict：title、base_height（歸一化前）
-    rows_cfg = [{"title": f"{symbol} K 線", "h": 0.50}]
+    rows_cfg = [{"title": f"{symbol} K 線", "h": 0.48}]
     if has_volume:
-        rows_cfg.append({"title": "成交量（張）",  "h": 0.20})
+        rows_cfg.append({"title": "成交量（張）",     "h": 0.16})
     if has_turnover:
-        rows_cfg.append({"title": "成交值（千元）", "h": 0.15})
+        rows_cfg.append({"title": "成交值（千元）",    "h": 0.12})
     if show_kd:
-        rows_cfg.append({"title": "KD 值",         "h": 0.20})
+        rows_cfg.append({"title": "KD 值",            "h": 0.16})
+    if show_rsi:
+        rows_cfg.append({"title": "RSI (14)",          "h": 0.16})
+    if show_macd:
+        rows_cfg.append({"title": "MACD (12,26,9)",    "h": 0.20})
 
     total_h    = sum(r["h"] for r in rows_cfg)
     row_heights = [r["h"] / total_h for r in rows_cfg]
@@ -388,6 +669,26 @@ def render_ohlcv_chart(
             line=dict(color=style["color"], width=1.5, dash=style["dash"]),
         ), row=1, col=1)
 
+    # ── Row 1 覆蓋：布林通道 ─────────────────────
+    if show_bb and {"bb_upper", "bb_mid", "bb_lower"}.issubset(df.columns):
+        fig.add_trace(go.Scatter(
+            x=x_labels, y=df["bb_upper"],
+            mode="lines", name="BB 上軌",
+            line=dict(color="#EF5350", width=1, dash="dot"),
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=x_labels, y=df["bb_mid"],
+            mode="lines", name="BB 中軌",
+            line=dict(color="#9E9E9E", width=1, dash="dot"),
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=x_labels, y=df["bb_lower"],
+            mode="lines", name="BB 下軌",
+            line=dict(color="#26A69A", width=1, dash="dot"),
+            fill="tonexty",
+            fillcolor="rgba(0,0,0,0.03)",
+        ), row=1, col=1)
+
     current_row = 2
 
     # ── Row 2：成交量 ────────────────────────────
@@ -414,7 +715,7 @@ def render_ohlcv_chart(
         fig.update_yaxes(title_text="千元", row=current_row, col=1)
         current_row += 1
 
-    # ── Row N：KD 值 ─────────────────────────────
+    # ── KD 值 ────────────────────────────────────
     if show_kd and "k_val" in df.columns and "d_val" in df.columns:
         fig.add_trace(go.Scatter(
             x=x_labels, y=df["k_val"],
@@ -426,12 +727,56 @@ def render_ohlcv_chart(
             mode="lines", name="D",
             line=dict(color="#2196F3", width=1.5),
         ), row=current_row, col=1)
-        # 超買 / 超賣參考線（Plotly stubs 將 row 標為 str，但實際接受 int）
         fig.add_hline(y=80, line=dict(color="#EF5350", dash="dash", width=1),
                       row=current_row, col=1)  # type: ignore[arg-type]
         fig.add_hline(y=20, line=dict(color="#26A69A", dash="dash", width=1),
                       row=current_row, col=1)  # type: ignore[arg-type]
         fig.update_yaxes(range=[0, 100], title_text="KD", row=current_row, col=1)
+        current_row += 1
+
+    # ── RSI(14) ───────────────────────────────────
+    if show_rsi and "rsi_14" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=x_labels, y=df["rsi_14"],
+            mode="lines", name="RSI",
+            line=dict(color="#7B1FA2", width=1.5),
+        ), row=current_row, col=1)
+        fig.add_hline(y=70, line=dict(color="#EF5350", dash="dot", width=1),
+                      row=current_row, col=1)  # type: ignore[arg-type]
+        fig.add_hline(y=50, line=dict(color="#9E9E9E", dash="dot", width=0.8),
+                      row=current_row, col=1)  # type: ignore[arg-type]
+        fig.add_hline(y=30, line=dict(color="#26A69A", dash="dot", width=1),
+                      row=current_row, col=1)  # type: ignore[arg-type]
+        fig.update_yaxes(range=[0, 100], title_text="RSI", row=current_row, col=1)
+        current_row += 1
+
+    # ── MACD (12,26,9) ────────────────────────────
+    if show_macd and "macd_hist" in df.columns:
+        hist_colors = [
+            "#EF5350" if (v is not None and not pd.isna(v) and float(v) >= 0) else "#26A69A"
+            for v in df["macd_hist"]
+        ]
+        fig.add_trace(go.Bar(
+            x=x_labels, y=df["macd_hist"],
+            marker_color=hist_colors,
+            name="MACD 柱", showlegend=False,
+        ), row=current_row, col=1)
+        if "macd_line" in df.columns:
+            fig.add_trace(go.Scatter(
+                x=x_labels, y=df["macd_line"],
+                mode="lines", name="DIF",
+                line=dict(color="#FF6B35", width=1.5),
+            ), row=current_row, col=1)
+        if "macd_signal" in df.columns:
+            fig.add_trace(go.Scatter(
+                x=x_labels, y=df["macd_signal"],
+                mode="lines", name="DEA",
+                line=dict(color="#2196F3", width=1.5),
+            ), row=current_row, col=1)
+        fig.add_hline(y=0, line=dict(color="#9E9E9E", dash="dot", width=0.8),
+                      row=current_row, col=1)  # type: ignore[arg-type]
+        fig.update_yaxes(title_text="MACD", row=current_row, col=1)
+        current_row += 1  # noqa: F841
 
     # ── 全域版面 ──────────────────────────────────
     chart_height = 380 + n_rows * 80
@@ -479,10 +824,16 @@ def render_single_stock_page() -> None:
 
         st.markdown("---")
         st.markdown("##### 技術指標")
-        show_ma5  = st.checkbox("MA5",  value=True)
-        show_ma10 = st.checkbox("MA10", value=True)
-        show_ma20 = st.checkbox("MA20", value=True)
-        show_kd   = st.checkbox("KD 值（9日）", value=True)
+        show_ma5  = st.checkbox("MA5",         value=True,  key="ss_ma5")
+        show_ma10 = st.checkbox("MA10",        value=True,  key="ss_ma10")
+        show_ma20 = st.checkbox("MA20",        value=True,  key="ss_ma20")
+        show_kd   = st.checkbox("KD（9日）",   value=True,  key="ss_kd")
+        show_bb   = st.checkbox("布林通道",     value=False, key="ss_bb",
+                                help="Bollinger Bands (20,2)；灰底為通道帶寬區域")
+        show_rsi  = st.checkbox("RSI（14）",   value=False, key="ss_rsi",
+                                help="相對強弱指標；70 超買 / 30 超賣")
+        show_macd = st.checkbox("MACD（12,26,9）", value=False, key="ss_macd",
+                                help="DIF / DEA / 柱狀圖")
 
         query_btn = st.button("查詢", type="primary", use_container_width=True)
 
@@ -499,10 +850,12 @@ def render_single_stock_page() -> None:
         ma_periods = [p for p, flag in [(5, show_ma5), (10, show_ma10), (20, show_ma20)] if flag]
 
         # 計算指標需要額外的暖機資料
-        # MA20 需 20 筆、KD(9) 需 9 筆，加 buffer 確保首幾筆也準確
-        # 季線（60MA）扣抵值計算需至少 60 筆，故 fetch_limit 至少取 100
-        warmup = max([0] + ma_periods + ([9] if show_kd else [])) + 20
-        fetch_limit = max(int(limit) + warmup, 100)
+        # MACD slow=26 需 26 筆，Bollinger period=20，RSI period=14
+        # 季線（60MA）扣抵值計算需至少 60 筆，故 fetch_limit 至少取 120
+        warmup = max([0] + ma_periods + ([9] if show_kd else []) +
+                     ([26] if show_macd else []) + ([20] if show_bb else []) +
+                     ([14] if show_rsi else [])) + 30
+        fetch_limit = max(int(limit) + warmup, 120)
 
         with st.spinner(f"正在取得 {symbol} 的歷史資料…"):
             try:
@@ -523,10 +876,12 @@ def render_single_stock_page() -> None:
             return
 
         # 在完整資料上計算指標（保留 warmup 確保準確性）
-        if ma_periods:
-            df_full = compute_ma(df_full, ma_periods)
-        if show_kd:
-            df_full = compute_kd(df_full)
+        # 進場訊號分析固定需要所有指標，一次計算完畢
+        df_full = compute_ma(df_full, [5, 10, 20])   # 進場訊號需要，多算不影響顯示
+        df_full = compute_kd(df_full)
+        df_full = compute_rsi(df_full)
+        df_full = compute_macd(df_full)
+        df_full = compute_bollinger(df_full)
 
         # 裁切至使用者指定的顯示天數
         df = df_full.tail(int(limit)).reset_index(drop=True)
@@ -535,6 +890,7 @@ def render_single_stock_page() -> None:
         prev        = df.iloc[-2] if len(df) >= 2 else latest
         price_delta = float(latest["close"]) - float(prev["close"]) if "close" in df.columns else 0
 
+        # ── 最新報價指標卡 ─────────────────────────
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         if "close"    in df.columns: m1.metric("收盤價",        f"{latest['close']:,.2f}",   f"{price_delta:+.2f}")
         if "open"     in df.columns: m2.metric("開盤價",        f"{latest['open']:,.2f}")
@@ -543,14 +899,58 @@ def render_single_stock_page() -> None:
         if "volume"   in df.columns: m5.metric("成交量（張）",   f"{int(latest['volume']):,}")
         if "turnover" in df.columns: m6.metric("成交值（千元）", f"{int(latest['turnover']):,}")
 
+        # ── 技術指標快訊（RSI / MACD / KD 數值）─────
+        has_rsi  = "rsi_14"    in df.columns
+        has_macd = "macd_hist" in df.columns
+        has_kd   = "k_val"     in df.columns
+        has_bb   = "bb_upper"  in df.columns
+        if any([has_rsi, has_macd, has_kd, has_bb]):
+            n_info = sum([has_rsi, has_macd, has_kd, has_bb])
+            info_cols = st.columns(n_info)
+            ic = 0
+            if has_rsi:
+                rsi_v = float(latest["rsi_14"])
+                rsi_label = "超買" if rsi_v > 70 else ("超賣" if rsi_v < 30 else "正常")
+                info_cols[ic].metric("RSI(14)", f"{rsi_v:.1f}", rsi_label)
+                ic += 1
+            if has_macd:
+                hist_v = float(latest["macd_hist"])
+                info_cols[ic].metric("MACD 柱", f"{hist_v:+.3f}",
+                                     "多頭" if hist_v > 0 else "空頭")
+                ic += 1
+            if has_kd:
+                k_v = float(latest["k_val"])
+                d_v = float(latest["d_val"])
+                info_cols[ic].metric("KD",
+                                     f"K {k_v:.1f} / D {d_v:.1f}",
+                                     "黃金" if k_v > d_v else "死亡")
+                ic += 1
+            if has_bb:
+                bb_w = float(latest["bb_width"]) if "bb_width" in df.columns else 0
+                info_cols[ic].metric("BB 帶寬", f"{bb_w:.3f}",
+                                     "擠壓" if bb_w < df["bb_width"].quantile(0.2) else "正常")
+
         st.markdown("---")
-        render_ohlcv_chart(df, symbol, show_ma=ma_periods, show_kd=show_kd)
+        render_ohlcv_chart(
+            df, symbol,
+            show_ma=ma_periods if ma_periods else [5, 10, 20],
+            show_kd=show_kd,
+            show_bb=show_bb,
+            show_rsi=show_rsi,
+            show_macd=show_macd,
+        )
         render_data_table(df, symbol)
 
         # ── 均線扣抵值模組（使用完整資料集確保季線有效）──
-        # df_full 會被回傳並新增 deduction_N / bias_pct_N / trend_N 歷史欄位
         df_full, deduction_data = calculate_deduction_values(df_full, int(limit))
         if deduction_data:
             render_deduction_section(deduction_data, symbol)
         else:
             st.info("顯示天數不足以計算任何均線扣抵值。")
+
+        # ── 進場訊號分析 ─────────────────────────────
+        entry_result = analyze_entry_signal(df_full)
+        if entry_result:
+            render_entry_signal(entry_result, symbol)
+        else:
+            st.info("資料筆數不足（需 30 筆以上）以進行進場訊號分析。")
