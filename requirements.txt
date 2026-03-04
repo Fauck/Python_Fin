@@ -8,3 +8,4 @@ yfinance>=0.2.40
 feedparser>=6.0.10
 beautifulsoup4>=4.12.0
 requests>=2.31.0
+lxml>=4.9.0
