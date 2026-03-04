@@ -166,22 +166,25 @@ def analyze_entry_signal(df_full: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     評分維度與權重
     ──────────────
-    趨勢 (35 分)：收盤站上 MA20 (15)、均線多頭排列 (15)、站上 MA5 (5)
+    趨勢 (50 分)：站上季線 MA60 (10)、站上月線 MA20 (15)、均線多頭排列 (15)、
+                  站上 MA5 (5)、MA20 方向向上 (5)
     動能 (35 分)：RSI(14) 狀態 (15)、MACD 柱狀正 (10)、KD K>D (10)
-    波動 (10 分)：布林通道位置 (10)
+    波動 (20 分)：布林通道位置 (10)、BB 壓縮突破 (10)
     量能 (10 分)：成交量確認 (10)
+    守門機制    ：收盤 < MA60 時，「強力進場」強制降為「偏多觀察」
 
     Returns
     -------
     None（資料不足）或 dict {
-        signal:    str   —「強力進場」/「偏多觀察」/「偏空觀望」/「謹慎避開」
-        color:     str   — CSS 色碼
-        score_pct: float — 得分百分比 (0~100)
-        total_pts: int
-        max_pts:   int
-        checks:    List[Dict] — 每項明細
-        close:     float
-        date:      str
+        signal:      str            —「強力進場」/「偏多觀察」/「偏空觀望」/「謹慎避開」
+        color:       str            — CSS 色碼
+        score_pct:   float          — 得分百分比 (0~100)
+        total_pts:   int
+        max_pts:     int
+        checks:      List[Dict]     — 每項明細
+        close:       float
+        date:        str
+        gate_reason: str | None     — 守門觸發說明（None 表示未觸發）
     }
     """
     if df_full is None or len(df_full) < 30:
@@ -191,7 +194,7 @@ def analyze_entry_signal(df_full: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     # 確保所有指標已計算（不重複計算已存在的欄位）
     if "ma5" not in df.columns:
-        df = compute_ma(df, [5, 10, 20])
+        df = compute_ma(df, [5, 10, 20, 60])
     if "k_val" not in df.columns:
         df = compute_kd(df)
     if "rsi_14" not in df.columns:
@@ -239,6 +242,26 @@ def analyze_entry_signal(df_full: pd.DataFrame) -> Optional[Dict[str, Any]]:
         add("📐 趨勢", "收盤站上短均線 MA5",
             ok, 5 if ok else 0, 5,
             f"收盤 {close:.2f} {'> MA5' if ok else '< MA5'} {ma5:.2f}")
+
+    # 季線確認（MA60）——「大環境」最重要的趨勢過濾器
+    ma60 = _sf(r.get("ma60"))
+    if ma60 is not None:
+        ok = close > ma60
+        add("📐 趨勢", "收盤站上季線 MA60",
+            ok, 10 if ok else 0, 10,
+            f"收盤 {close:.2f} {'> ↑ 季線多頭' if ok else '< ↓ 季線空頭'} MA60 {ma60:.2f}")
+
+    # MA20 斜率（月線是否仍在上揚？）
+    if "ma20" in df.columns and len(df) >= 6:
+        ma20_now  = _sf(df["ma20"].iloc[-1])
+        ma20_prev = _sf(df["ma20"].iloc[-6])
+        if ma20_now is not None and ma20_prev is not None and ma20_prev > 0:
+            rising    = ma20_now > ma20_prev
+            slope_pct = (ma20_now - ma20_prev) / ma20_prev * 100
+            add("📐 趨勢", "月線方向向上 (MA20 斜率)",
+                rising, 5 if rising else 0, 5,
+                f"MA20 近5日{'上揚 ↑' if rising else '下彎 ↓'} {slope_pct:+.2f}%"
+                f"（{ma20_prev:.2f} → {ma20_now:.2f}）")
 
     # ── 動能 ─────────────────────────────────
     rsi = _sf(r.get("rsi_14"))
@@ -349,15 +372,30 @@ def analyze_entry_signal(df_full: pd.DataFrame) -> Optional[Dict[str, Any]]:
     else:
         signal, color = "謹慎避開", "#B71C1C"
 
+    # ── 多空環境守門（防呆機制）──────────────────────────────────
+    # 若收盤站在季線（MA60）以下，最多給「偏多觀察」
+    # 大環境空頭格局下，短線反彈訊號的歷史勝率顯著偏低
+    gate_reason: Optional[str] = None
+    ma60_gate = _sf(r.get("ma60"))
+    if ma60_gate is not None and close < ma60_gate:
+        if signal == "強力進場":
+            signal = "偏多觀察"
+            color  = "#F57F17"
+            gate_reason = (
+                f"季線守門：收盤 {close:.2f} 位於 MA60 {ma60_gate:.2f} 以下，"
+                "大環境偏空，信號上限壓制為「偏多觀察」"
+            )
+
     return {
-        "signal":    signal,
-        "color":     color,
-        "score_pct": round(pct, 1),
-        "total_pts": total_pts,
-        "max_pts":   max_pts,
-        "checks":    checks,
-        "close":     close,
-        "date":      str(df_full.iloc[-1]["date"])[:10],
+        "signal":      signal,
+        "color":       color,
+        "score_pct":   round(pct, 1),
+        "total_pts":   total_pts,
+        "max_pts":     max_pts,
+        "checks":      checks,
+        "close":       close,
+        "date":        str(df_full.iloc[-1]["date"])[:10],
+        "gate_reason": gate_reason,
     }
 
 
@@ -432,6 +470,10 @@ def render_entry_signal(result: Dict[str, Any], symbol: str) -> None:
 
     st.markdown("---")
     st.subheader(f"🎯 {symbol} 進場訊號分析")
+
+    gate_reason = result.get("gate_reason")
+    if gate_reason:
+        st.warning(f"⚠️ {gate_reason}", icon="🚧")
 
     col_badge, col_checks = st.columns([1, 2], gap="large")
 
@@ -913,7 +955,7 @@ def render_single_stock_page() -> None:
 
         # 在完整資料上計算指標（保留 warmup 確保準確性）
         # 進場訊號分析固定需要所有指標，一次計算完畢
-        df_full = compute_ma(df_full, [5, 10, 20])   # 進場訊號需要，多算不影響顯示
+        df_full = compute_ma(df_full, [5, 10, 20, 60])   # 含季線，進場訊號守門需要
         df_full = compute_kd(df_full)
         df_full = compute_rsi(df_full)
         df_full = compute_macd(df_full)
