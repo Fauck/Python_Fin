@@ -112,11 +112,11 @@ def compute_score_mode_a(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     # ── 動能 Momentum（30 分）───────────────────
     if rsi is not None:
-        if 50 <= rsi <= 70:
+        if rsi >= 70:
+            rsi_pts, rsi_st = 15, f"RSI {rsi:.1f}（≥ 70 動能極強 🔥）"
+        elif rsi >= 50:
             rsi_pts, rsi_st = 15, f"RSI {rsi:.1f}（50~70 健康多頭 ✅）"
-        elif rsi > 70:
-            rsi_pts, rsi_st = 10, f"RSI {rsi:.1f}（> 70 超買警示 ⚠️）"
-        elif 40 <= rsi < 50:
+        elif rsi >= 40:
             rsi_pts, rsi_st =  5, f"RSI {rsi:.1f}（40~50 中性偏弱）"
         else:
             rsi_pts, rsi_st =  0, f"RSI {rsi:.1f}（< 40 弱勢 ❌）"
@@ -233,6 +233,17 @@ def compute_score_mode_b(df: pd.DataFrame, yield_bonus: int = 0) -> Optional[Dic
     k_    = _f("k_stoch")
     d_    = _f("d_stoch")
 
+    # 前一根 K、D（用於判斷黃金交叉方向）
+    if len(df) >= 2:
+        prev_row = df.iloc[-2]
+        def _fp(col: str) -> Optional[float]:
+            v = prev_row[col] if col in df.columns else None
+            return None if (v is None or pd.isna(v)) else float(v)
+        prev_k = _fp("k_stoch")
+        prev_d = _fp("d_stoch")
+    else:
+        prev_k, prev_d = None, None
+
     # ── 價格位階 Price Level（40 分）────────────
     if close is not None and ma60 is not None:
         if close < ma60:
@@ -260,10 +271,16 @@ def compute_score_mode_b(df: pd.DataFrame, yield_bonus: int = 0) -> Optional[Dic
         rsi_pts, rsi_st = 0, "資料不足"
 
     if close is not None and ma60 is not None:
-        bias     = (close - ma60) / ma60 * 100
-        bias_pts = 20 if bias < -10 else 0
-        bias_st  = (f"乖離率 {bias:.1f}%（< -10% 深度超賣 ✅）" if bias < -10
-                    else f"乖離率 {bias:.1f}%（未達 -10%）")
+        bias = (close - ma60) / ma60 * 100
+        if bias < -10:
+            bias_pts = 20
+            bias_st  = f"乖離率 {bias:.1f}%（< -10% 深度超賣 ✅）"
+        elif bias < -5:
+            bias_pts = 10
+            bias_st  = f"乖離率 {bias:.1f}%（-10%~-5% 中度超賣）"
+        else:
+            bias_pts = 0
+            bias_st  = f"乖離率 {bias:.1f}%（未達 -5%）"
         bias_val = f"{bias:.1f}%"
     else:
         bias_pts, bias_st, bias_val = 0, "資料不足", "N/A"
@@ -272,9 +289,18 @@ def compute_score_mode_b(df: pd.DataFrame, yield_bonus: int = 0) -> Optional[Dic
 
     # ── 長線基期 LT Baseline（20 分）────────────
     if k_ is not None and d_ is not None:
-        if k_ < 20 and d_ < 20 and k_ > d_:
+        # 真正的黃金交叉：昨天 K <= D，今天 K > D，且兩者皆 < 20
+        is_golden_cross = (
+            prev_k is not None and prev_d is not None
+            and k_ < 20 and d_ < 20
+            and prev_k <= prev_d and k_ > d_
+        )
+        if is_golden_cross:
             kd_pts = 20
             kd_st  = f"K={k_:.1f} D={d_:.1f}（低檔黃金交叉 ✅）"
+        elif k_ < 20 and d_ < 20 and k_ > d_:
+            kd_pts = 10
+            kd_st  = f"K={k_:.1f} D={d_:.1f}（K > D 低檔維持，非今日交叉）"
         elif k_ < 20 and d_ < 20:
             kd_pts = 10
             kd_st  = f"K={k_:.1f} D={d_:.1f}（KD 低檔盤旋，尚未交叉）"
