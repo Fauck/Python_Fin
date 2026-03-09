@@ -10,6 +10,7 @@
   backtester.py         →  🔁 策略回測
   financial_report.py   →  📋 財務報告
   news_finder.py        →  📰 財經新聞
+  valuation_analyzer.py →  💎 估值分析
 共用工具：
   utils.py              →  資料層 + 技術指標計算
 """
@@ -23,6 +24,7 @@ from chips_analyzer import render_chips_page
 from backtester import render_backtest_page
 from financial_report import render_financial_page
 from news_finder import render_news_page
+from valuation_analyzer import render_valuation_page
 
 
 def main() -> None:
@@ -35,9 +37,9 @@ def main() -> None:
     st.caption("資料來源：Fugle Market Data API")
 
     (tab_single, tab_screener, tab_score,
-     tab_chips, tab_backtest, tab_fin, tab_news) = st.tabs([
+     tab_chips, tab_backtest, tab_fin, tab_news, tab_valuation) = st.tabs([
         "📈 單股分析", "🔍 選股策略", "🎯 綜合評分",
-        "🏦 籌碼分析", "🔁 策略回測", "📋 財務報告", "📰 財經新聞",
+        "🏦 籌碼分析", "🔁 策略回測", "📋 財務報告", "📰 財經新聞", "💎 估值分析",
     ])
 
     with tab_single:
@@ -60,6 +62,9 @@ def main() -> None:
 
     with tab_news:
         render_news_page()
+
+    with tab_valuation:
+        render_valuation_page()
 
 
 if __name__ == "__main__":
