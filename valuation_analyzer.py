@@ -5,10 +5,13 @@
 設計原則
 --------
 - 100% 使用者主動觸發（無任何排程或背景任務）
-- 資料來源：yfinance（台股自動加 .TW / .TWO 後綴）
+- 資料來源：
+    * 每日收盤價      → yfinance
+    * 配息記錄        → Fugle API（台股）/ yfinance 回退
+    * 季度 EPS/BVPS  → yfinance quarterly_income_stmt / quarterly_balance_sheet
+- TTM (Trailing Twelve Months)：近四季滾動 EPS，河流圖呈平滑波浪
 - @st.cache_data(ttl=3600) 快取避免重複呼叫
-- 河流圖（Filled Area Band Chart）：5 條估值軌跡 + 實際股價線
-- 估值診斷：將當前股價對應到 5 個估值區間並給出燈號
+- st.session_state 保存查詢結果，避免圖表因互動消失
 """
 
 import re
@@ -19,6 +22,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+
+from utils import get_fugle_client
 
 
 # ── 台股代號識別（4~6 位純數字）
@@ -37,11 +42,11 @@ _FILL_COLORS = [
 
 # ── 估值區間診斷（zone 0~4 對應便宜~昂貴）
 _EVAL_ZONES: List[Tuple[str, str, str, str]] = [
-    ("🟢", "便宜",   "#2E7D32", "股價具備安全邊際，為長線佈局良機"),
-    ("🟢", "合理偏低","#558B2F", "估值偏低，可搭配技術面突破訊號考慮進場"),
-    ("🟡", "合理",   "#F9A825", "估值合理，建議搭配技術面突破訊號進場"),
-    ("🟠", "合理偏高","#E65100", "估值略高，建議等待回調或控制倉位"),
-    ("🔴", "昂貴",   "#B71C1C", "估值偏高，潛在回檔風險大，不建議追高"),
+    ("🟢", "便宜",    "#2E7D32", "股價具備安全邊際，為長線佈局良機"),
+    ("🟢", "合理偏低", "#558B2F", "估值偏低，可搭配技術面突破訊號考慮進場"),
+    ("🟡", "合理",    "#F9A825", "估值合理，建議搭配技術面突破訊號進場"),
+    ("🟠", "合理偏高", "#E65100", "估值略高，建議等待回調或控制倉位"),
+    ("🔴", "昂貴",    "#B71C1C", "估值偏高，潛在回檔風險大，不建議追高"),
 ]
 
 
@@ -56,18 +61,6 @@ def _to_float(v: Any) -> Optional[float]:
         return None if (pd.isna(f) or np.isinf(f)) else f
     except Exception:
         return None
-
-
-def _get_df(ticker: yf.Ticker, *names: str) -> Optional[pd.DataFrame]:
-    """依序嘗試多個 yfinance 屬性名，回傳第一個非空 DataFrame。"""
-    for name in names:
-        try:
-            df = getattr(ticker, name, None)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                return df
-        except Exception:
-            pass
-    return None
 
 
 def _find_row(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
@@ -105,14 +98,33 @@ def _align_to_daily(
     price_df: pd.DataFrame,
 ) -> pd.Series:
     """
-    將年度基本面資料前向填充至每日交易日索引。
-    annual_series：以財年結束日為索引的 Series。
-    price_df     ：以交易日為索引的 DataFrame（DatetimeIndex）。
+    將基本面資料（年度或季度，索引為財報日期）前向填充至每日交易日索引。
+    price_df 必須已有 DatetimeIndex。
     """
     combined = annual_series.reindex(
         annual_series.index.union(price_df.index)
     ).sort_index().ffill()
     return combined.reindex(price_df.index)
+
+
+def _compute_ttm_quarterly(
+    q_series: pd.Series,
+    price_df: pd.DataFrame,
+) -> pd.Series:
+    """
+    將季度 EPS Series（升冪日期索引）轉為 TTM（近四季滾動加總），
+    再前向填充至每日。
+
+    TTM EPS = 最近四個季度 EPS 之和，每當新季報發布即平滑更新。
+    若有效季度 < 4，回傳空 Series（上層函式視為資料不足）。
+    """
+    q = q_series.sort_index().dropna()
+    if len(q) < 4:
+        return pd.Series(dtype=float, index=price_df.index)
+    ttm = q.rolling(4, min_periods=4).sum().dropna()
+    if ttm.empty:
+        return pd.Series(dtype=float, index=price_df.index)
+    return _align_to_daily(ttm, price_df)
 
 
 def _five_equal_levels(
@@ -122,7 +134,6 @@ def _five_equal_levels(
 ) -> Optional[List[float]]:
     """
     將比率序列裁切 outlier 後，等距切出 5 個水準值。
-    用於計算 P/E、P/B 的 5 條帶線倍數。
     """
     lo = ratio_series.quantile(clip_lo)
     hi = ratio_series.quantile(clip_hi)
@@ -133,7 +144,74 @@ def _five_equal_levels(
 
 
 # ═════════════════════════════════════════════
-# 資料層：yfinance 抓取
+# Fugle 配息資料（台股優先來源）
+# ═════════════════════════════════════════════
+
+def _fetch_dividends_fugle(symbol: str) -> Optional[pd.Series]:
+    """
+    透過 Fugle API 取得台股歷史配息，回傳以年度結尾日為索引的年度現金配息 Series。
+    失敗時回傳 None（交由上層 fallback 至 yfinance）。
+
+    Fugle dividends 資料格式（動態欄位名稱，以模式比對）：
+    - 現金股利欄：含 "cash" + "div" 的欄位
+    - 日期欄    ：含 "date" 或 "year" 的欄位
+    """
+    try:
+        client = get_fugle_client()
+        raw = client.stock.historical.dividends(  # type: ignore[attr-defined]
+            **{"symbol": symbol}
+        )
+
+        records: List[dict] = []
+        if isinstance(raw, dict):
+            records = list(raw.get("data", []))
+        elif isinstance(raw, list):
+            records = list(raw)
+
+        if not records:
+            return None
+
+        df = pd.DataFrame(records)
+
+        # 找現金股利欄
+        cash_col: Optional[str] = next(
+            (c for c in df.columns if "cash" in c.lower() and "div" in c.lower()),
+            next((c for c in df.columns if "cash" in c.lower()), None),
+        )
+        # 找日期欄
+        date_col: Optional[str] = next(
+            (c for c in df.columns if "date" in c.lower()),
+            next((c for c in df.columns if "year" in c.lower()), None),
+        )
+
+        if cash_col is None or date_col is None:
+            return None
+
+        df[cash_col] = pd.to_numeric(df[cash_col], errors="coerce")
+        df = df.dropna(subset=[cash_col])
+        df = df[df[cash_col] > 0]
+
+        if df.empty:
+            return None
+
+        # 日期欄轉型
+        df[date_col] = pd.to_datetime(df[date_col].astype(str), errors="coerce")
+        df = df.dropna(subset=[date_col])
+
+        # 依年加總（同一年可能有多次配息）
+        df["_year"] = pd.DatetimeIndex(df[date_col]).year
+        annual = df.groupby("_year")[cash_col].sum()
+
+        # 轉換為年底日期索引
+        idx = pd.DatetimeIndex([f"{y}-12-31" for y in annual.index])
+        return pd.Series(annual.values, index=idx, dtype=float).sort_index()
+
+    except Exception:
+        return None
+
+
+# ═════════════════════════════════════════════
+# 資料層：yfinance + Fugle 混合抓取
 # ═════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
@@ -142,49 +220,39 @@ def fetch_valuation_data(
     years: int = 5,
 ) -> Optional[Dict[str, Any]]:
     """
-    從 yfinance 取得估值分析所需的歷史資料。
+    取得估值分析所需歷史資料。
 
-    台股自動識別流程
-    ---------------
-    1. 4-6 位純數字 → 先嘗試 .TW（上市）
-    2. .TW 無歷史價格 → 改嘗試 .TWO（上櫃）
-    3. 含後綴或英文代號 → 直接使用
-
-    Parameters
-    ----------
-    symbol : 股票代號（例如 "2330"、"0050"、"TSLA"）
-    years  : 往前取幾年的歷史資料（預設 5）
+    資料來源策略
+    -----------
+    - 每日收盤價    : yfinance history()（.TW / .TWO 自動識別）
+    - 季度 EPS      : yfinance quarterly_income_stmt → TTM rolling 4Q
+    - 季度 BVPS     : yfinance quarterly_balance_sheet（最新季前向填充）
+    - 年度配息      : Fugle API dividends（台股）→ fallback yfinance dividends
 
     Returns
     -------
-    None   → 抓取失敗（代號錯誤 / 無資料）
-    dict {
-        symbol_full  : str          — 解析後含後綴代號
-        price_df     : DataFrame    — 日收盤價（DatetimeIndex, col="close"）
-        eps_annual   : Series       — 年 EPS（財年結束日索引）
-        bvps_annual  : Series       — 年每股淨值
-        div_annual   : Series       — 年化總配息
-        current_price: float
-        current_eps  : float | None
-        current_bvps : float | None
-        current_div  : float | None  — 最近完整年度總配息
-        info         : dict          — ticker.info 原始資料
-    }
+    None（抓取失敗）或 dict：
+        symbol_full   : str
+        price_df      : DataFrame (DatetimeIndex, col="close")
+        eps_daily     : Series  — TTM EPS daily（或季度 fallback）
+        bvps_daily    : Series  — 季度 BVPS daily
+        div_annual    : Series  — 年度配息
+        div_daily     : Series  — 年度配息前向填充至每日
+        current_price : float
+        current_eps   : float | None
+        current_bvps  : float | None
+        current_div   : float | None
+        info          : dict
     """
-    raw = symbol.strip().upper()
-    candidates = (
-        [f"{raw}.TW", f"{raw}.TWO"]
-        if _TW_CODE_RE.match(raw)
-        else [raw]
-    )
+    raw   = symbol.strip().upper()
+    is_tw = bool(_TW_CODE_RE.match(raw))
+    candidates = [f"{raw}.TW", f"{raw}.TWO"] if is_tw else [raw]
 
-    tk: Optional[yf.Ticker]  = None
+    # ── 1. 每日收盤價（yfinance）────────────────────────────────
+    tk: Optional[yf.Ticker] = None
     price_df   = pd.DataFrame()
-    income_df: Optional[pd.DataFrame] = None
-    bs_df:     Optional[pd.DataFrame] = None
-    dividends  = pd.Series(dtype=float)
     info: Dict[str, Any] = {}
-    resolved = raw
+    resolved   = raw
 
     for sym in candidates:
         try:
@@ -196,18 +264,6 @@ def fetch_valuation_data(
             resolved = sym
             price_df = hist[["Close"]].rename(columns={"Close": "close"})
             price_df.index = pd.DatetimeIndex(price_df.index).tz_localize(None)
-
-            income_df = _get_df(tk, "income_stmt", "financials")
-            bs_df     = _get_df(tk, "balance_sheet")
-            try:
-                raw_div = tk.dividends
-                if isinstance(raw_div, pd.Series) and not raw_div.empty:
-                    dividends = raw_div.copy()
-                    dividends.index = pd.DatetimeIndex(
-                        dividends.index
-                    ).tz_localize(None)
-            except Exception:
-                pass
             try:
                 info = tk.info or {}
             except Exception:
@@ -223,43 +279,127 @@ def fetch_valuation_data(
     if current_price is None:
         return None
 
-    # ── Annual EPS ────────────────────────────────────────────────
-    eps_annual: pd.Series = pd.Series(dtype=float)
-    if income_df is not None:
-        eps_row = _find_row(income_df, ["Basic EPS", "Diluted EPS"])
-        if eps_row is not None:
-            eps_annual = _row_to_series(eps_row)
-        else:
-            ni_row = _find_row(income_df, [
-                "Net Income", "Net Income Common Stockholders",
-            ])
-            shares = _to_float(info.get("sharesOutstanding"))
-            if ni_row is not None and shares and shares > 0:
-                eps_annual = _row_to_series(ni_row) / shares
+    # ── 2. 季度 EPS → TTM（yfinance quarterly_income_stmt）─────
+    eps_daily: pd.Series = pd.Series(dtype=float, index=price_df.index)
+
+    if tk is not None:
+        try:
+            q_inc = getattr(tk, "quarterly_income_stmt", None) or \
+                    getattr(tk, "quarterly_financials",  None)
+            if isinstance(q_inc, pd.DataFrame) and not q_inc.empty:
+                eps_row = _find_row(q_inc, ["Basic EPS", "Diluted EPS"])
+                if eps_row is not None:
+                    eps_daily = _compute_ttm_quarterly(_row_to_series(eps_row), price_df)
+                else:
+                    # Fallback：淨利 / 股數
+                    ni_row = _find_row(q_inc, [
+                        "Net Income", "Net Income Common Stockholders",
+                    ])
+                    shares = _to_float(info.get("sharesOutstanding"))
+                    if ni_row is not None and shares and shares > 0:
+                        q_eps = _row_to_series(ni_row) / shares
+                        eps_daily = _compute_ttm_quarterly(q_eps, price_df)
+        except Exception:
+            pass
+
+    # Fallback 2：年報 EPS（Basic/Diluted 或 Net Income / shares）
+    if eps_daily.dropna().empty and tk is not None:
+        try:
+            a_inc = getattr(tk, "income_stmt", None) or \
+                    getattr(tk, "financials",    None)
+            if isinstance(a_inc, pd.DataFrame) and not a_inc.empty:
+                eps_row = _find_row(a_inc, ["Basic EPS", "Diluted EPS"])
+                if eps_row is not None:
+                    eps_daily = _align_to_daily(_row_to_series(eps_row), price_df)
+                else:
+                    # 年報 Net Income / shares（台股常見格式）
+                    ni_row = _find_row(a_inc, [
+                        "Net Income", "Net Income Common Stockholders",
+                    ])
+                    shares_a = _to_float(info.get("sharesOutstanding"))
+                    if ni_row is not None and shares_a and shares_a > 0:
+                        eps_a = _row_to_series(ni_row) / shares_a
+                        eps_daily = _align_to_daily(eps_a, price_df)
+        except Exception:
+            pass
+
+    # Fallback 3：用 trailingEps 建立水平基準線（帶線為等距水平，仍可診斷當前估值）
+    if eps_daily.dropna().empty:
+        trailing = _to_float(info.get("trailingEps"))
+        if trailing is not None and trailing > 0:
+            eps_daily = pd.Series(trailing, index=price_df.index, dtype=float)
 
     current_eps = _to_float(info.get("trailingEps")) or (
-        _to_float(eps_annual.iloc[-1]) if not eps_annual.empty else None
+        _to_float(eps_daily.dropna().iloc[-1]) if not eps_daily.dropna().empty else None
     )
 
-    # ── Annual BVPS ───────────────────────────────────────────────
-    bvps_annual: pd.Series = pd.Series(dtype=float)
-    if bs_df is not None:
-        eq_row = _find_row(bs_df, [
-            "Stockholders Equity", "Total Stockholder Equity",
-            "Common Stock Equity", "Total Equity Gross Minority Interest",
-        ])
+    # ── 3. BVPS（季報 → 年報 → bookValue 水平線，三層 fallback）──
+    bvps_daily: pd.Series = pd.Series(dtype=float, index=price_df.index)
+    _EQ_ROWS = [
+        "Stockholders Equity", "Total Stockholder Equity",
+        "Common Stock Equity", "Total Equity Gross Minority Interest",
+    ]
+
+    if tk is not None:
         shares = _to_float(info.get("sharesOutstanding"))
-        if eq_row is not None and shares and shares > 0:
-            bvps_annual = _row_to_series(eq_row) / shares
+        if shares and shares > 0:
+            # Fallback 1：季報
+            try:
+                q_bs = getattr(tk, "quarterly_balance_sheet", None)
+                if isinstance(q_bs, pd.DataFrame) and not q_bs.empty:
+                    eq_row = _find_row(q_bs, _EQ_ROWS)
+                    if eq_row is not None:
+                        bvps_daily = _align_to_daily(
+                            _row_to_series(eq_row) / shares, price_df
+                        )
+            except Exception:
+                pass
+
+            # Fallback 2：年報
+            if bvps_daily.dropna().empty:
+                try:
+                    a_bs = getattr(tk, "balance_sheet", None)
+                    if isinstance(a_bs, pd.DataFrame) and not a_bs.empty:
+                        eq_row = _find_row(a_bs, _EQ_ROWS)
+                        if eq_row is not None:
+                            bvps_daily = _align_to_daily(
+                                _row_to_series(eq_row) / shares, price_df
+                            )
+                except Exception:
+                    pass
+
+    # Fallback 3：bookValue 水平基準線
+    if bvps_daily.dropna().empty:
+        book_val = _to_float(info.get("bookValue"))
+        if book_val is not None and book_val > 0:
+            bvps_daily = pd.Series(book_val, index=price_df.index, dtype=float)
 
     current_bvps = _to_float(info.get("bookValue")) or (
-        _to_float(bvps_annual.iloc[-1]) if not bvps_annual.empty else None
+        _to_float(bvps_daily.dropna().iloc[-1]) if not bvps_daily.dropna().empty else None
     )
 
-    # ── Annual Dividends ──────────────────────────────────────────
+    # ── 4. 年度配息（Fugle 優先，回退 yfinance）────────────────
     div_annual: pd.Series = pd.Series(dtype=float)
-    if not dividends.empty:
-        div_annual = dividends.resample("YE").sum()
+
+    if is_tw:
+        fugle_divs = _fetch_dividends_fugle(raw)
+        if fugle_divs is not None and not fugle_divs.empty:
+            div_annual = fugle_divs
+
+    if div_annual.empty and tk is not None:
+        try:
+            raw_div = tk.dividends
+            if isinstance(raw_div, pd.Series) and not raw_div.empty:
+                divs = raw_div.copy()
+                divs.index = pd.DatetimeIndex(divs.index).tz_localize(None)
+                yearly = divs.resample("YE").sum()
+                div_annual = yearly[yearly > 0]
+        except Exception:
+            pass
+
+    div_daily: pd.Series = pd.Series(dtype=float, index=price_df.index)
+    if not div_annual.empty:
+        div_daily = _align_to_daily(div_annual, price_df)
 
     current_div = (
         _to_float(div_annual.iloc[-1]) if not div_annual.empty else None
@@ -268,9 +408,10 @@ def fetch_valuation_data(
     return {
         "symbol_full":  resolved,
         "price_df":     price_df,
-        "eps_annual":   eps_annual,
-        "bvps_annual":  bvps_annual,
+        "eps_daily":    eps_daily,    # TTM EPS（或年度 fallback），已對齊每日
+        "bvps_daily":   bvps_daily,   # 季度 BVPS，已對齊每日
         "div_annual":   div_annual,
+        "div_daily":    div_daily,
         "current_price": current_price,
         "current_eps":  current_eps,
         "current_bvps": current_bvps,
@@ -283,47 +424,42 @@ def fetch_valuation_data(
 # 計算層：P/E / P/B / 殖利率 河流資料
 # ═════════════════════════════════════════════
 
-def compute_pe_bands(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def compute_pe_bands(
+    data: Dict[str, Any],
+    custom_levels: Optional[List[float]] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    計算本益比河流圖資料。
+    計算本益比（P/E）河流圖資料。
 
-    流程
-    ----
-    1. 將年 EPS 前向填充至每日
-    2. 計算每日 P/E = 收盤 / EPS（僅保留 EPS > 0 的日期）
-    3. 截去頭尾各 10% outlier，等距切出 5 個 P/E 水準
-    4. 5 條帶線 = 各 P/E 水準 × 每日 EPS（隨時間流動的河流）
-    5. 當前帶線 = 各 P/E 水準 × current_eps（診斷用）
-
-    Returns
-    -------
-    None（資料不足）或 {ratio_series, pe_levels, bands_df,
-                         current_bands, current_ratio, ...}
+    帶線 = TTM EPS × 5 個 P/E 水準，隨 EPS 平滑漂移（波浪狀，非階梯狀）。
+    custom_levels：使用者自訂的 5 個 P/E 倍數（任意順序，函式內部確保升冪）。
     """
     price_df    = data["price_df"]
-    eps_annual  = data["eps_annual"]
+    eps_daily   = data["eps_daily"]
     current_eps = data["current_eps"]
 
-    if eps_annual.empty or current_eps is None or current_eps <= 0:
+    if eps_daily.dropna().empty or current_eps is None or current_eps <= 0:
         return None
 
-    eps_daily    = _align_to_daily(eps_annual, price_df)
     valid        = eps_daily.notna() & (eps_daily > 0)
     ratio_series = (price_df["close"][valid] / eps_daily[valid]).dropna()
 
-    if len(ratio_series) < 30:
-        return None
-
-    pe_levels = _five_equal_levels(ratio_series)
-    if pe_levels is None:
-        return None
+    if custom_levels is not None:
+        pe_levels: List[float] = sorted(custom_levels)          # 強制升冪
+    else:
+        if len(ratio_series) < 30:
+            return None
+        hist_levels = _five_equal_levels(ratio_series)
+        if hist_levels is None:
+            return None
+        pe_levels = hist_levels
 
     bands: Dict[str, pd.Series] = {}
     for i, lvl in enumerate(pe_levels):
         bands[_BAND_LABELS[i]] = (eps_daily * lvl).where(eps_daily > 0)
     bands_df = pd.DataFrame(bands, index=price_df.index)
 
-    current_bands = [lvl * current_eps for lvl in pe_levels]
+    current_bands = sorted([lvl * current_eps for lvl in pe_levels])  # 升冪保證
     current_ratio = price_df["close"].iloc[-1] / current_eps
 
     return {
@@ -334,39 +470,45 @@ def compute_pe_bands(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "current_ratio": round(current_ratio, 2),
         "current_fund":  current_eps,
         "ratio_name":    "P/E（本益比）",
-        "fund_label":    "EPS",
+        "fund_label":    "EPS（TTM）",
         "unit":          "倍",
     }
 
 
-def compute_pb_bands(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def compute_pb_bands(
+    data: Dict[str, Any],
+    custom_levels: Optional[List[float]] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    計算股價淨值比河流圖資料（邏輯與 P/E 相同，基本面換成 BVPS）。
+    計算股價淨值比（P/B）河流圖資料。使用季度 BVPS 前向填充（較年度更平滑）。
+    custom_levels：使用者自訂的 5 個 P/B 倍數（任意順序，函式內部確保升冪）。
     """
     price_df     = data["price_df"]
-    bvps_annual  = data["bvps_annual"]
+    bvps_daily   = data["bvps_daily"]
     current_bvps = data["current_bvps"]
 
-    if bvps_annual.empty or current_bvps is None or current_bvps <= 0:
+    if bvps_daily.dropna().empty or current_bvps is None or current_bvps <= 0:
         return None
 
-    bvps_daily   = _align_to_daily(bvps_annual, price_df)
     valid        = bvps_daily.notna() & (bvps_daily > 0)
     ratio_series = (price_df["close"][valid] / bvps_daily[valid]).dropna()
 
-    if len(ratio_series) < 30:
-        return None
-
-    pb_levels = _five_equal_levels(ratio_series)
-    if pb_levels is None:
-        return None
+    if custom_levels is not None:
+        pb_levels: List[float] = sorted(custom_levels)          # 強制升冪
+    else:
+        if len(ratio_series) < 30:
+            return None
+        hist_levels = _five_equal_levels(ratio_series)
+        if hist_levels is None:
+            return None
+        pb_levels = hist_levels
 
     bands: Dict[str, pd.Series] = {}
     for i, lvl in enumerate(pb_levels):
         bands[_BAND_LABELS[i]] = (bvps_daily * lvl).where(bvps_daily > 0)
     bands_df = pd.DataFrame(bands, index=price_df.index)
 
-    current_bands = [lvl * current_bvps for lvl in pb_levels]
+    current_bands = sorted([lvl * current_bvps for lvl in pb_levels])  # 升冪保證
     current_ratio = price_df["close"].iloc[-1] / current_bvps
 
     return {
@@ -382,30 +524,26 @@ def compute_pb_bands(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def compute_yield_bands(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def compute_yield_bands(
+    data: Dict[str, Any],
+    custom_levels: Optional[List[float]] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    計算歷史殖利率通道資料。
+    計算歷史殖利率通道（Fugle 取得的年配息）。
 
-    關鍵差異（與 PE/PB 相反）
-    -------------------------
-    - 高殖利率 ↔ 低股價 → 便宜（帶線底部，綠色）
-    - 低殖利率 ↔ 高股價 → 昂貴（帶線頂部，紅色）
+    高殖利率 ↔ 低股價 → 便宜（帶線底部，綠色）
+    低殖利率 ↔ 高股價 → 昂貴（帶線頂部，紅色）
 
-    流程
-    ----
-    1. 計算每日殖利率（%） = 年配息 / 收盤價 × 100
-    2. 截去 outlier，等距切出 5 個殖利率水準（從高到低）
-    3. 帶線價格 = 年配息 / (殖利率水準 / 100)
-       → 帶線由低到高（便宜→昂貴），顏色由綠到紅
+    custom_levels：使用者自訂的 5 個殖利率（%），任意順序。
+                   函式內部排成降冪（高殖利率在前）→ 對應帶線價格升冪。
     """
     price_df    = data["price_df"]
-    div_annual  = data["div_annual"]
+    div_daily   = data["div_daily"]
     current_div = data["current_div"]
 
-    if div_annual.empty or current_div is None or current_div <= 0:
+    if div_daily.dropna().empty or current_div is None or current_div <= 0:
         return None
 
-    div_daily = _align_to_daily(div_annual, price_df)
     valid = (
         price_df["close"].notna() & (price_df["close"] > 0)
         & div_daily.notna() & (div_daily > 0)
@@ -414,29 +552,28 @@ def compute_yield_bands(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         div_daily[valid] / price_df["close"][valid] * 100
     ).dropna()
 
-    if len(yield_series) < 30:
-        return None
-
-    # 高殖利率 = 便宜；低殖利率 = 昂貴
-    # 水準從高到低（對應帶線從低到高）
-    y_hi = yield_series.quantile(0.90)
-    y_lo = yield_series.quantile(0.10)
-    if pd.isna(y_lo) or pd.isna(y_hi) or y_lo <= 0 or y_hi <= y_lo:
-        return None
-
-    step = (y_hi - y_lo) / 4
-    # yield_levels[0] = 最高殖利率（最便宜） → 帶線最低（綠底）
-    # yield_levels[4] = 最低殖利率（最昂貴） → 帶線最高（紅頂）
-    yield_levels = [y_hi - i * step for i in range(5)]
+    if custom_levels is not None:
+        # 降冪排列殖利率（高殖利率=便宜在前）→ 帶線價格自然升冪
+        raw_yields = sorted(custom_levels, reverse=True)
+        # 確保所有殖利率 > 0（防呆）
+        yield_levels: List[float] = [max(y, 0.01) for y in raw_yields]
+    else:
+        if len(yield_series) < 30:
+            return None
+        y_hi = yield_series.quantile(0.90)
+        y_lo = yield_series.quantile(0.10)
+        if pd.isna(y_lo) or pd.isna(y_hi) or y_lo <= 0 or y_hi <= y_lo:
+            return None
+        step = (y_hi - y_lo) / 4
+        yield_levels = [y_hi - i * step for i in range(5)]
 
     bands: Dict[str, pd.Series] = {}
     for i, y_lvl in enumerate(yield_levels):
-        bands[_BAND_LABELS[i]] = (div_daily / (y_lvl / 100)).where(
-            div_daily > 0
-        )
+        bands[_BAND_LABELS[i]] = (div_daily / (y_lvl / 100)).where(div_daily > 0)
     bands_df = pd.DataFrame(bands, index=price_df.index)
 
-    current_bands = [current_div / (y / 100) for y in yield_levels]
+    # current_bands：price = div / (yield/100)，yield 降冪 → price 升冪，再 sort 保證
+    current_bands = sorted([current_div / (y / 100) for y in yield_levels])
     current_yield = current_div / price_df["close"].iloc[-1] * 100
 
     return {
@@ -462,13 +599,7 @@ def evaluate_current_price(
 ) -> Dict[str, str]:
     """
     診斷目前股價所在的估值區間。
-
-    current_bands 必須是 5 個升冪排列的帶線價格
-    （便宜帶線最低、昂貴帶線最高），對 P/E / P/B / 殖利率三種方法均適用。
-
-    Returns
-    -------
-    dict { zone, label, icon, color, description }
+    current_bands 必須是 5 個升冪排列的帶線價格。
     """
     if len(current_bands) < 5:
         return {}
@@ -507,18 +638,9 @@ def build_river_chart(
     current_price: float,
     eval_result: Optional[Dict[str, str]] = None,
 ) -> go.Figure:
-    """
-    繪製估值河流圖（Filled Area Band Chart + 實際股價線）。
-
-    視覺結構
-    --------
-    - 5 個漸層色塊區間（底部綠 = 便宜，頂部紅 = 昂貴）
-    - 深色實線 = 實際歷史收盤價（置於所有帶線之上）
-    - 藍色虛線 = 現在股價水平線
-    """
+    """繪製估值河流圖（Filled Area Band Chart + 實際股價線）。"""
     fig = go.Figure()
 
-    # ── 5 個填色帶線（由低到高疊加）────────────────────────────
     prev_y: Optional[pd.Series] = None
 
     for i, label in enumerate(_BAND_LABELS):
@@ -543,7 +665,6 @@ def build_river_chart(
         ))
         prev_y = y_vals
 
-    # ── 實際收盤價線（黑色粗線，置頂）─────────────────────────
     price_x = pd.DatetimeIndex(price_df.index).strftime("%Y-%m-%d")
     fig.add_trace(go.Scatter(
         x=price_x,
@@ -554,7 +675,6 @@ def build_river_chart(
         hovertemplate="<b>%{x}</b><br>收盤：%{y:,.2f}<extra></extra>",
     ))
 
-    # ── 現價水平虛線 ─────────────────────────────────────────
     price_color = eval_result["color"] if eval_result else "#1565C0"
     fig.add_hline(
         y=current_price,
@@ -572,10 +692,7 @@ def build_river_chart(
         hovermode="x unified",
         legend=dict(orientation="h", y=1.08, x=0, xanchor="left"),
         margin=dict(l=60, r=80, t=90, b=50),
-        xaxis=dict(
-            showgrid=True, gridcolor="#f0f0f0",
-            tickangle=-30, nticks=12,
-        ),
+        xaxis=dict(showgrid=True, gridcolor="#f0f0f0", tickangle=-30, nticks=12),
         yaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
     )
     return fig
@@ -593,10 +710,10 @@ def _render_eval_badge(
     unit: str,
 ) -> None:
     """渲染估值診斷徽章。"""
-    color  = eval_result["color"]
-    icon   = eval_result["icon"]
-    label  = eval_result["label"]
-    desc   = eval_result["description"]
+    color = eval_result["color"]
+    icon  = eval_result["icon"]
+    label = eval_result["label"]
+    desc  = eval_result["description"]
 
     st.markdown(f"""
 <div style="
@@ -623,10 +740,126 @@ def _render_eval_badge(
     st.caption(desc)
 
 
+def _render_zone_cards(
+    eval_result: Dict[str, str],
+    current_bands: List[float],
+) -> None:
+    """渲染 5 個估值區間彩色卡片，顯示帶線價格與價格範圍。"""
+    b = current_bands
+    range_strs = [
+        f"低於 {b[1]:,.0f}",
+        f"{b[1]:,.0f} ～ {b[2]:,.0f}",
+        f"{b[2]:,.0f} ～ {b[3]:,.0f}",
+        f"{b[3]:,.0f} ～ {b[4]:,.0f}",
+        f"高於 {b[4]:,.0f}",
+    ]
+    current_zone = int(eval_result.get("zone", -1))
+    zone_cols = st.columns(5)
+    for i, (zcol, band_p, rng) in enumerate(zip(zone_cols, b, range_strs)):
+        icon, lbl, color, _ = _EVAL_ZONES[i]
+        is_cur = (i == current_zone)
+        border = f"2px solid {color}" if is_cur else f"1px solid {color}66"
+        bg     = f"{color}22"         if is_cur else "#fafafa"
+        marker = "▶ 現價所在區間"    if is_cur else ""
+        zcol.markdown(f"""
+<div style="border:{border};border-radius:10px;padding:14px 8px;
+            text-align:center;background:{bg};min-height:140px;">
+  <div style="font-size:20px;line-height:1.2;">{icon}</div>
+  <div style="font-size:13px;font-weight:700;color:{color};
+              margin:4px 0;">{lbl}</div>
+  <div style="font-size:20px;font-weight:800;color:#212121;
+              line-height:1.3;">{band_p:,.2f}</div>
+  <div style="font-size:11px;color:#888;margin-top:4px;">{rng}</div>
+  <div style="font-size:10px;font-weight:600;color:{color};
+              min-height:14px;margin-top:4px;">{marker}</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+def _render_results(cache: Dict[str, Any]) -> None:
+    """從 session_state cache 渲染所有估值結果（圖表、卡片、統計）。"""
+    data          = cache["data"]
+    band_data     = cache["band_data"]
+    eval_result   = cache["eval_result"]
+    resolved      = data["symbol_full"]
+    current_price = data["current_price"]
+    years         = cache["years"]
+    is_custom     = cache.get("is_custom", False)
+
+    st.markdown(f"##### {resolved} &nbsp; 估值分析（近 {years} 年）")
+    st.caption(
+        f"資料來源：Yahoo Finance (yfinance) ＋ Fugle API ｜ "
+        f"現價：{current_price:,.2f}"
+    )
+
+    if is_custom:
+        st.warning("⚙️ 目前使用**自訂估值倍數**（非歷史統計分位數）", icon="⚠️")
+
+    badge_col, chart_col = st.columns([1, 2.5], gap="large")
+
+    with badge_col:
+        _render_eval_badge(
+            eval_result   = eval_result,
+            current_price = current_price,
+            current_ratio = band_data["current_ratio"],
+            ratio_name    = band_data["ratio_name"],
+            unit          = band_data["unit"],
+        )
+
+    with chart_col:
+        ratio_brief = band_data["ratio_name"].split("（")[0]
+        suffix      = "自訂倍數" if is_custom else "TTM EPS｜5 等份估值帶"
+        title_str   = (
+            f"{resolved}　{ratio_brief}河流圖"
+            f"（近 {years} 年｜{suffix}）"
+        )
+        fig = build_river_chart(
+            price_df      = data["price_df"],
+            bands_df      = band_data["bands_df"],
+            title         = title_str,
+            current_price = current_price,
+            eval_result   = eval_result,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── 各估值區間價格卡片 ─────────────────────────────────────
+    st.markdown("---")
+    st.markdown("##### 各估值區間帶線價格")
+    _render_zone_cards(eval_result, band_data["current_bands"])
+
+    # ── 歷史比率統計摘要 ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown(f"##### {band_data['ratio_name']} 歷史統計摘要")
+    rs = band_data["ratio_series"]
+    stat_cols = st.columns(5)
+    stats = [
+        ("最低值（P10）", rs.quantile(0.10)),
+        ("25 分位",       rs.quantile(0.25)),
+        ("中位數",        rs.quantile(0.50)),
+        ("75 分位",       rs.quantile(0.75)),
+        ("最高值（P90）", rs.quantile(0.90)),
+    ]
+    unit = band_data["unit"]
+    for col, (lbl, val) in zip(stat_cols, stats):
+        col.metric(lbl, f"{val:.2f} {unit}")
+
+    st.caption(
+        f"當前 {band_data['ratio_name'].split('（')[0]}："
+        f"**{band_data['current_ratio']} {band_data['unit']}**"
+        f"　｜　統計區間：近 {years} 年（P10 ~ P90，去除首尾 10% 極端值）"
+    )
+
+
 def render_valuation_page() -> None:
     """估值分析頁面（Tab 8）。"""
+
+    # ── Upgrade 3：session_state 保存查詢結果 ─────────────────
+    if "val_cache" not in st.session_state:
+        st.session_state["val_cache"] = None
+
     ctrl_col, result_col = st.columns([1, 3], gap="large")
 
+    # ── 左欄：控制面板 ────────────────────────────────────────
     with ctrl_col:
         st.markdown("#### 查詢條件")
         symbol = st.text_input(
@@ -657,19 +890,130 @@ def render_valuation_page() -> None:
             ],
             key="val_method",
             help=(
-                "• P/E：適合有穩定獲利的成長股\n"
+                "• P/E：適合有穩定獲利的成長股（使用 TTM 近四季 EPS）\n"
                 "• P/B：適合景氣循環股或金融股\n"
                 "• 殖利率：適合高股息 ETF 或穩定配息標的"
             ),
         )
+
+        # ── 自訂倍數面板 ──────────────────────────────────────
+        with st.expander("⚙️ 進階：自訂估值倍數", expanded=False):
+            use_custom: bool = st.checkbox(
+                "啟用自訂倍數（覆蓋歷史預設值）",
+                key="use_custom_bands",
+            )
+            custom_levels: Optional[List[float]] = None
+
+            if use_custom:
+                mk = (method or "")[:1]
+                if mk == "📊":
+                    _labels   = ["便宜 P/E 倍", "合理偏低 P/E 倍", "合理 P/E 倍",
+                                 "合理偏高 P/E 倍", "昂貴 P/E 倍"]
+                    _defaults = [8.0, 12.0, 16.0, 20.0, 25.0]
+                    _step, _fmt = 0.5, "%.1f"
+                    st.caption("由小到大輸入；系統自動排序，確保帶線升冪。")
+                elif mk == "📚":
+                    _labels   = ["便宜 P/B 倍", "合理偏低 P/B 倍", "合理 P/B 倍",
+                                 "合理偏高 P/B 倍", "昂貴 P/B 倍"]
+                    _defaults = [0.8, 1.2, 1.6, 2.0, 2.5]
+                    _step, _fmt = 0.1, "%.2f"
+                    st.caption("由小到大輸入；系統自動排序，確保帶線升冪。")
+                else:
+                    _labels   = ["便宜 殖利率%", "合理偏低 殖利率%", "合理 殖利率%",
+                                 "合理偏高 殖利率%", "昂貴 殖利率%"]
+                    _defaults = [7.0, 5.5, 4.0, 3.0, 2.0]
+                    _step, _fmt = 0.1, "%.2f"
+                    st.caption("殖利率由高到低（高殖利率=便宜）；系統自動反推對應股價。")
+
+                _vals: List[float] = []
+                for _i, (_lbl, _dft) in enumerate(zip(_labels, _defaults)):
+                    _v = st.number_input(
+                        _lbl, value=_dft, step=_step, format=_fmt,
+                        min_value=0.01, key=f"custom_level_{_i}",
+                    )
+                    _vals.append(float(_v))
+                custom_levels = _vals
 
         query_btn = st.button(
             "查詢估值", type="primary", use_container_width=True,
             key="val_query",
         )
 
+    # ── 右欄：結果 ────────────────────────────────────────────
     with result_col:
-        if not query_btn:
+
+        # 按鈕按下 → 計算並存入 session_state
+        if query_btn:
+            if not symbol:
+                st.error("股票代號不得為空。")
+                st.session_state["val_cache"] = None
+
+            else:
+                with st.spinner(f"正在取得 {symbol} 歷史資料（{years} 年）…"):
+                    try:
+                        data = fetch_valuation_data(symbol=symbol, years=years)
+                    except Exception as e:
+                        st.error(f"資料抓取失敗：{e}")
+                        st.session_state["val_cache"] = None
+                        data = None
+
+                if data is None:
+                    st.warning(
+                        f"查無 **{symbol}** 的歷史資料。\n\n"
+                        "可能原因：代號錯誤、Yahoo Finance 尚未收錄此標的、"
+                        "或目前網路連線不穩定。"
+                    )
+                    st.session_state["val_cache"] = None
+
+                else:
+                    method_key = (method or "")[:1]
+                    _HINTS = {
+                        "📊": (
+                            f"**{data['symbol_full']}** 的本益比河流圖資料不足。\n\n"
+                            "可能原因：\n"
+                            "- Yahoo Finance 未提供此標的的 EPS 季報資料\n"
+                            "- 近期出現虧損（EPS ≤ 0）\n\n"
+                            "建議改用「淨值比河流圖」或「殖利率通道」。"
+                        ),
+                        "📚": (
+                            f"**{data['symbol_full']}** 的淨值比河流圖資料不足。\n\n"
+                            "可能原因：Yahoo Finance 未提供每股淨值季報資料。\n\n"
+                            "建議改用「本益比」或確認代號是否正確。"
+                        ),
+                        "💰": (
+                            f"**{data['symbol_full']}** 近期無配息記錄，"
+                            "無法建立殖利率通道。\n\n"
+                            "建議改用「本益比」或「淨值比」河流圖。"
+                        ),
+                    }
+
+                    with st.spinner("正在計算估值帶線…"):
+                        if method_key == "📊":
+                            band_data = compute_pe_bands(data, custom_levels=custom_levels)
+                        elif method_key == "📚":
+                            band_data = compute_pb_bands(data, custom_levels=custom_levels)
+                        else:
+                            band_data = compute_yield_bands(data, custom_levels=custom_levels)
+
+                    if band_data is None:
+                        st.warning(_HINTS.get(method_key, "資料不足，無法計算。"))
+                        st.session_state["val_cache"] = None
+                    else:
+                        eval_result = evaluate_current_price(
+                            data["current_price"], band_data["current_bands"]
+                        )
+                        st.session_state["val_cache"] = {
+                            "data":        data,
+                            "band_data":   band_data,
+                            "eval_result": eval_result,
+                            "years":       years,
+                            "is_custom":   use_custom,
+                        }
+
+        # 從 session_state 渲染（即使沒有按按鈕也能保留圖表）
+        cache = st.session_state.get("val_cache")
+
+        if cache is None and not query_btn:
             st.info(
                 "請在左側輸入股票代號，選擇估值方法後點擊「查詢估值」。\n\n"
                 "**三種估值方法說明**\n\n"
@@ -678,162 +1022,11 @@ def render_valuation_page() -> None:
                 "| 本益比河流 (P/E) | 成長股、科技股、有穩定 EPS 者 |\n"
                 "| 淨值比河流 (P/B) | 金融股、景氣循環股、資產股 |\n"
                 "| 殖利率通道 | 高股息 ETF（0056、00878）、配息穩定存股標的 |\n\n"
-                "**河流圖原理**\n\n"
-                "依歷史倍數範圍等距切出 5 條帶線（便宜→昂貴），"
-                "帶線隨基本面數據（EPS / BVPS / 配息）同步漂移，"
-                "實際股價線在帶線中的位置即代表目前估值高低。\n\n"
-                "**資料來源：** Yahoo Finance（透過 yfinance）"
+                "**升級說明**\n\n"
+                "- P/E 帶線採用 **TTM（近四季滾動 EPS）**，呈現平滑波浪而非階梯\n"
+                "- 配息資料優先使用 **Fugle API**（台股），準確度更高\n"
+                "- 圖表縮放、互動後結果**不會消失**（session_state 保存）\n\n"
+                "**資料來源：** Yahoo Finance (yfinance) ＋ Fugle Market Data API"
             )
-            return
-
-        if not symbol:
-            st.error("股票代號不得為空。")
-            return
-
-        with st.spinner(f"正在取得 {symbol} 歷史資料（{years} 年）…"):
-            try:
-                data = fetch_valuation_data(symbol=symbol, years=years)
-            except Exception as e:
-                st.error(f"資料抓取失敗：{e}")
-                return
-
-        if data is None:
-            st.warning(
-                f"查無 **{symbol}** 的歷史資料。\n\n"
-                "可能原因：代號錯誤、Yahoo Finance 尚未收錄此標的、"
-                "或目前網路連線不穩定。"
-            )
-            return
-
-        resolved = data["symbol_full"]
-        current_price = data["current_price"]
-
-        st.markdown(f"##### {resolved} &nbsp; 估值分析（近 {years} 年）")
-        st.caption(
-            f"資料來源：Yahoo Finance (yfinance) ｜ "
-            f"現價：{current_price:,.2f}"
-        )
-
-        # ── 根據選擇的方法計算帶線資料 ──────────────────────────
-        method_key = (method or "")[:2]   # "📊" / "📚" / "💰"
-        band_data: Optional[Dict] = None
-
-        with st.spinner("正在計算估值帶線…"):
-            if method_key == "📊":
-                band_data = compute_pe_bands(data)
-            elif method_key == "📚":
-                band_data = compute_pb_bands(data)
-            else:
-                band_data = compute_yield_bands(data)
-
-        if band_data is None:
-            # Provide specific guidance for each method
-            hints = {
-                "📊": (
-                    f"**{resolved}** 的本益比河流圖資料不足。\n\n"
-                    "可能原因：\n"
-                    "- Yahoo Finance 未提供此標的的 EPS 歷史資料（常見於部分台股）\n"
-                    "- 近期出現虧損（EPS ≤ 0），無法計算有意義的本益比\n\n"
-                    "建議改用「淨值比河流圖」或「殖利率通道」。"
-                ),
-                "📚": (
-                    f"**{resolved}** 的淨值比河流圖資料不足。\n\n"
-                    "可能原因：Yahoo Finance 未提供每股淨值歷史資料。\n\n"
-                    "建議改用「本益比河流圖」或確認股票代號是否正確。"
-                ),
-                "💰": (
-                    f"**{resolved}** 近期無配息記錄，無法建立殖利率通道。\n\n"
-                    "建議改用「本益比河流圖」或「淨值比河流圖」。"
-                ),
-            }
-            st.warning(hints.get(method_key, "資料不足，無法計算。"))
-            return
-
-        # ── 估值診斷 ─────────────────────────────────────────────
-        eval_result = evaluate_current_price(
-            current_price, band_data["current_bands"]
-        )
-
-        # ── 版面：左欄＝診斷徽章，右欄＝河流圖 ──────────────────
-        badge_col, chart_col = st.columns([1, 2.5], gap="large")
-
-        with badge_col:
-            _render_eval_badge(
-                eval_result   = eval_result,
-                current_price = current_price,
-                current_ratio = band_data["current_ratio"],
-                ratio_name    = band_data["ratio_name"],
-                unit          = band_data["unit"],
-            )
-
-        with chart_col:
-            ratio_brief = band_data["ratio_name"].split("（")[0]
-            title_str   = (
-                f"{resolved}　{ratio_brief}河流圖"
-                f"（近 {years} 年｜5 等份估值帶）"
-            )
-            fig = build_river_chart(
-                price_df      = data["price_df"],
-                bands_df      = band_data["bands_df"],
-                title         = title_str,
-                current_price = current_price,
-                eval_result   = eval_result,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        # ── 各估值區間現值 ────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("##### 各估值區間帶線價格")
-        b = band_data["current_bands"]   # [b0, b1, b2, b3, b4]，升冪
-        range_strs = [
-            f"低於 {b[1]:,.0f}",
-            f"{b[1]:,.0f} ～ {b[2]:,.0f}",
-            f"{b[2]:,.0f} ～ {b[3]:,.0f}",
-            f"{b[3]:,.0f} ～ {b[4]:,.0f}",
-            f"高於 {b[4]:,.0f}",
-        ]
-        current_zone = int(eval_result.get("zone", -1))
-        zone_cols = st.columns(5)
-        for i, (zcol, band_p, rng) in enumerate(
-            zip(zone_cols, b, range_strs)
-        ):
-            icon, lbl, color, _ = _EVAL_ZONES[i]
-            is_cur = (i == current_zone)
-            border = f"2px solid {color}" if is_cur else f"1px solid {color}66"
-            bg     = f"{color}22"         if is_cur else "#fafafa"
-            marker = "▶ 現價所在區間"    if is_cur else ""
-            zcol.markdown(f"""
-<div style="border:{border};border-radius:10px;padding:14px 8px;
-            text-align:center;background:{bg};min-height:140px;">
-  <div style="font-size:20px;line-height:1.2;">{icon}</div>
-  <div style="font-size:13px;font-weight:700;color:{color};
-              margin:4px 0;">{lbl}</div>
-  <div style="font-size:20px;font-weight:800;color:#212121;
-              line-height:1.3;">{band_p:,.2f}</div>
-  <div style="font-size:11px;color:#888;margin-top:4px;">{rng}</div>
-  <div style="font-size:10px;font-weight:600;color:{color};
-              min-height:14px;margin-top:4px;">{marker}</div>
-</div>
-""", unsafe_allow_html=True)
-
-        # ── 歷史比率統計摘要 ─────────────────────────────────────
-        st.markdown("---")
-        st.markdown(f"##### {band_data['ratio_name']} 歷史統計摘要")
-        rs = band_data["ratio_series"]
-        stat_cols = st.columns(5)
-        stats = [
-            ("最低值（P10）", rs.quantile(0.10)),
-            ("25 分位",       rs.quantile(0.25)),
-            ("中位數",        rs.quantile(0.50)),
-            ("75 分位",       rs.quantile(0.75)),
-            ("最高值（P90）", rs.quantile(0.90)),
-        ]
-        for col, (lbl, val) in zip(stat_cols, stats):
-            unit = band_data["unit"]
-            col.metric(lbl, f"{val:.2f} {unit}")
-
-        st.caption(
-            f"當前 {band_data['ratio_name'].split('（')[0]}："
-            f"**{band_data['current_ratio']} {band_data['unit']}**"
-            f"　｜　統計區間：近 {years} 年（P10 ~ P90，去除首尾 10% 極端值）"
-        )
+        elif cache is not None:
+            _render_results(cache)
