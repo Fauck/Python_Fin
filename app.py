@@ -36,17 +36,36 @@ def main() -> None:
     st.title("📊 台股分析儀表板")
     st.caption("資料來源：Fugle Market Data API")
 
-    (tab_single, tab_screener, tab_score,
-     tab_chips, tab_backtest, tab_fin, tab_news, tab_valuation) = st.tabs([
-        "📈 單股分析", "🔍 選股策略", "🎯 綜合評分",
-        "🏦 籌碼分析", "🔁 策略回測", "📋 財務報告", "📰 財經新聞", "💎 估值分析",
-    ])
+    # ── 側邊欄開關：隱藏耗時的策略分析頁籤 ─────────────────────────
+    with st.sidebar:
+        hide_strategy = st.toggle(
+            "隱藏策略分析頁籤",
+            value=True,
+            help="開啟時暫時隱藏「🔍 選股策略」與「🔁 策略回測」，加快頁面載入速度。",
+        )
+
+    # ── 依開關狀態動態組建 Tab 列表 ──────────────────────────────────
+    if hide_strategy:
+        (tab_single, tab_score, tab_chips,
+         tab_fin, tab_news, tab_valuation) = st.tabs([
+            "📈 單股分析", "🎯 綜合評分", "🏦 籌碼分析",
+            "📋 財務報告", "📰 財經新聞", "💎 估值分析",
+        ])
+        tab_screener = None
+        tab_backtest = None
+    else:
+        (tab_single, tab_screener, tab_score,
+         tab_chips, tab_backtest, tab_fin, tab_news, tab_valuation) = st.tabs([
+            "📈 單股分析", "🔍 選股策略", "🎯 綜合評分",
+            "🏦 籌碼分析", "🔁 策略回測", "📋 財務報告", "📰 財經新聞", "💎 估值分析",
+        ])
 
     with tab_single:
         render_single_stock_page()
 
-    with tab_screener:
-        render_screener_page()
+    if tab_screener is not None:
+        with tab_screener:
+            render_screener_page()
 
     with tab_score:
         render_score_page()
@@ -54,8 +73,9 @@ def main() -> None:
     with tab_chips:
         render_chips_page()
 
-    with tab_backtest:
-        render_backtest_page()
+    if tab_backtest is not None:
+        with tab_backtest:
+            render_backtest_page()
 
     with tab_fin:
         render_financial_page()
