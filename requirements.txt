@@ -15,7 +15,8 @@ pandas-ta
 plotly
 yfinance
 fugle-marketdata
+python-dotenv
 requests
 beautifulsoup4
 lxml
-python-dotenv
+feedparser
