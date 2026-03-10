@@ -654,12 +654,17 @@ def render_ohlcv_chart(
     show_bb: bool = False,
     show_rsi: bool = False,
     show_macd: bool = False,
+    res_price: Optional[float] = None,
+    sup_price: Optional[float] = None,
+    poc_price: Optional[float] = None,
+    res_label: str = "壓力區",
+    sup_label: str = "支撐區",
 ) -> None:
     """
     繪製 K 線 + 均線 + 布林 + 成交量 + 成交值 + KD / RSI / MACD 子圖。
 
     子圖結構（依資料與參數動態決定）：
-      Row 1：K 線圖 + MA 均線覆蓋 + 布林通道（選用）
+      Row 1：K 線圖 + MA 均線覆蓋 + 布林通道（選用）+ 壓力 / 支撐 / POC 虛線
       Row 2：成交量柱狀圖（若有資料）
       Row 3：成交值柱狀圖（若有資料）
       Row N：KD / RSI / MACD（依啟用順序）
@@ -673,6 +678,9 @@ def render_ohlcv_chart(
     show_bb   : 是否在 K 線圖上疊加布林通道
     show_rsi  : 是否顯示 RSI(14) 子圖
     show_macd : 是否顯示 MACD 子圖
+    res_price : 壓力價位（最高收盤）；不為 None 時繪製紅色虛線
+    sup_price : 支撐價位（最低收盤）；不為 None 時繪製綠色虛線
+    poc_price : 最大量能典型價格；不為 None 時繪製橙色實線
     """
     required = {"open", "high", "low", "close", "date"}
     if not required.issubset(df.columns):
@@ -752,6 +760,35 @@ def render_ohlcv_chart(
             bgcolor="rgba(255,255,255,0.85)",
             bordercolor="#26A69A", borderwidth=1, borderpad=3,
             row=1, col=1,
+        )
+
+    # ── Row 1：壓力線 / 支撐線 ──────────────────────
+    if res_price is not None:
+        fig.add_hline(
+            y=res_price,
+            line=dict(color="#EF5350", dash="dash", width=1.5),
+            annotation_text=f"{res_label} {res_price:,.2f}",
+            annotation_position="right",
+            annotation_font=dict(color="#EF5350", size=11),
+            row=1, col=1,  # type: ignore[arg-type]
+        )
+    if sup_price is not None:
+        fig.add_hline(
+            y=sup_price,
+            line=dict(color="#2E7D32", dash="dash", width=1.5),
+            annotation_text=f"{sup_label} {sup_price:,.2f}",
+            annotation_position="right",
+            annotation_font=dict(color="#2E7D32", size=11),
+            row=1, col=1,  # type: ignore[arg-type]
+        )
+    if poc_price is not None:
+        fig.add_hline(
+            y=poc_price,
+            line=dict(color="#FF9800", dash="solid", width=1.5),
+            annotation_text=f"大量籌碼區 {poc_price:,.2f}",
+            annotation_position="right",
+            annotation_font=dict(color="#FF9800", size=11),
+            row=1, col=1,  # type: ignore[arg-type]
         )
 
     # ── Row 1 覆蓋：均線 ─────────────────────────
@@ -925,6 +962,16 @@ def render_single_stock_page() -> None:
         # custom_to   = st.date_input("結束日期",  value=None)
 
         st.markdown("---")
+        st.markdown("##### 支撐 / 壓力")
+        sr_method = st.radio(
+            "計算邏輯",
+            options=["20日極值 (箱型)", "N字轉折 (波段)"],
+            horizontal=True,
+            key="ss_sr_method",
+            help="20日極值：近20日最高/最低絕對極端；N字轉折：5根滾動視窗波段高低點（排除最後2根避免 look-ahead bias）",
+        )
+
+        st.markdown("---")
         st.markdown("##### 技術指標")
         show_ma5  = st.checkbox("MA5",         value=True,  key="ss_ma5")
         show_ma10 = st.checkbox("MA10",        value=True,  key="ss_ma10")
@@ -992,6 +1039,59 @@ def render_single_stock_page() -> None:
         prev        = df.iloc[-2] if len(df) >= 2 else latest
         price_delta = float(latest["close"]) - float(prev["close"]) if "close" in df.columns else 0
 
+        # ── 近期壓力 / 支撐（依使用者選擇的計算邏輯）────────────────────
+        close_now: Optional[float] = float(latest["close"]) if "close" in df.columns else None
+        res_price: Optional[float] = None
+        sup_price: Optional[float] = None
+        res_label      = "壓力區"
+        sup_label      = "支撐區"
+        res_card_title = "🔴 近期壓力"
+        sup_card_title = "🟢 近期支撐"
+
+        if sr_method == "20日極值 (箱型)":
+            if "high" in df.columns:
+                res_price = float(df["high"].tail(20).max())
+            if "low"  in df.columns:
+                sup_price = float(df["low"].tail(20).min())
+            res_label      = "箱型壓力"
+            sup_label      = "箱型支撐"
+            res_card_title = "🔴 近期箱型壓力（20日最高）"
+            sup_card_title = "🟢 近期箱型支撐（20日最低）"
+
+        else:  # N字轉折 (波段)
+            if "high" in df_full.columns and "low" in df_full.columns:
+                sh_series = (df_full["high"]
+                             == df_full["high"].rolling(window=5, center=True).max())
+                sl_series = (df_full["low"]
+                             == df_full["low"].rolling(window=5, center=True).min())
+                # 排除最後 2 根（右側視窗尚未成型），避免 look-ahead bias
+                sh_true_idx = sh_series.iloc[:-2][sh_series.iloc[:-2]].index
+                sl_true_idx = sl_series.iloc[:-2][sl_series.iloc[:-2]].index
+                # 退避：找不到轉折點時退回 20 日極值
+                if len(sh_true_idx) > 0:
+                    res_price = float(df_full.loc[sh_true_idx[-1], "high"])  # type: ignore[arg-type]
+                elif "high" in df.columns:
+                    res_price = float(df["high"].tail(20).max())
+                if len(sl_true_idx) > 0:
+                    sup_price = float(df_full.loc[sl_true_idx[-1], "low"])  # type: ignore[arg-type]
+                elif "low" in df.columns:
+                    sup_price = float(df["low"].tail(20).min())
+            res_label      = "轉折壓力"
+            sup_label      = "轉折支撐"
+            res_card_title = "🔴 前高轉折壓力（Swing High）"
+            sup_card_title = "🟢 前低轉折支撐（Swing Low）"
+
+        # ── Volume POC（近 20 日最大量典型價格，獨立於壓力/支撐邏輯）──
+        df_20 = df.tail(20)
+        poc_price: Optional[float] = None
+        if (all(c in df_20.columns for c in ["volume", "high", "low", "close"])
+                and df_20["volume"].notna().any()):
+            max_vol_pos = int(df_20["volume"].argmax())
+            max_vol_row = df_20.iloc[max_vol_pos]
+            poc_price = float(
+                (float(max_vol_row["high"]) + float(max_vol_row["low"]) + float(max_vol_row["close"])) / 3
+            )
+
         # ── 最新報價指標卡 ─────────────────────────
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         if "close"    in df.columns: m1.metric("收盤價",        f"{latest['close']:,.2f}",   f"{price_delta:+.2f}")
@@ -1058,6 +1158,57 @@ def render_single_stock_page() -> None:
                 unsafe_allow_html=True,
             )
 
+        # ── 近期支撐與壓力卡片 ──────────────────────────────────────
+        if res_price is not None and sup_price is not None and close_now is not None:
+            st.markdown("##### 🎯 近期支撐與壓力（近 20 日區間）")
+            res_pct = (res_price - close_now) / close_now * 100
+            sup_pct = (sup_price - close_now) / close_now * 100
+            col_res, col_sup, col_poc = st.columns(3)
+            with col_res:
+                st.markdown(f"""
+<div style="border:1.5px solid #EF5350;border-radius:10px;padding:14px 16px;
+background:#FFEBEE;text-align:center;">
+  <div style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">
+    {res_card_title}
+  </div>
+  <div style="font-size:26px;font-weight:800;color:#EF5350;margin-bottom:6px;">
+    {res_price:,.2f}
+  </div>
+  <div style="font-size:13px;color:#C62828;">
+    距現價 <b>{res_pct:+.2f}%</b>（突破即轉強）
+  </div>
+</div>""", unsafe_allow_html=True)
+            with col_sup:
+                st.markdown(f"""
+<div style="border:1.5px solid #2E7D32;border-radius:10px;padding:14px 16px;
+background:#E8F5E9;text-align:center;">
+  <div style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">
+    {sup_card_title}
+  </div>
+  <div style="font-size:26px;font-weight:800;color:#2E7D32;margin-bottom:6px;">
+    {sup_price:,.2f}
+  </div>
+  <div style="font-size:13px;color:#2E7D32;">
+    距現價 <b>{sup_pct:+.2f}%</b>（跌破即轉弱）
+  </div>
+</div>""", unsafe_allow_html=True)
+            with col_poc:
+                if poc_price is not None:
+                    poc_pct = (poc_price - close_now) / close_now * 100
+                    st.markdown(f"""
+<div style="border:1.5px solid #FF9800;border-radius:10px;padding:14px 16px;
+background:#FFF8E1;text-align:center;">
+  <div style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">
+    🔥 最大量能區（近20日）
+  </div>
+  <div style="font-size:26px;font-weight:800;color:#FF9800;margin-bottom:6px;">
+    {poc_price:,.2f}
+  </div>
+  <div style="font-size:13px;color:#E65100;">
+    距現價 <b>{poc_pct:+.2f}%</b>（籌碼密集換手區）
+  </div>
+</div>""", unsafe_allow_html=True)
+
         st.markdown("---")
         render_ohlcv_chart(
             df, symbol,
@@ -1066,6 +1217,11 @@ def render_single_stock_page() -> None:
             show_bb=show_bb,
             show_rsi=show_rsi,
             show_macd=show_macd,
+            res_price=res_price,
+            sup_price=sup_price,
+            poc_price=poc_price,
+            res_label=res_label,
+            sup_label=sup_label,
         )
         render_data_table(df, symbol)
 
