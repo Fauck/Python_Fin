@@ -659,6 +659,7 @@ def render_ohlcv_chart(
     poc_price: Optional[float] = None,
     res_label: str = "壓力區",
     sup_label: str = "支撐區",
+    poc_label: str = "大量籌碼區",
 ) -> None:
     """
     繪製 K 線 + 均線 + 布林 + 成交量 + 成交值 + KD / RSI / MACD 子圖。
@@ -785,7 +786,7 @@ def render_ohlcv_chart(
         fig.add_hline(
             y=poc_price,
             line=dict(color="#FF9800", dash="solid", width=1.5),
-            annotation_text=f"大量籌碼區 {poc_price:,.2f}",
+            annotation_text=f"{poc_label} {poc_price:,.2f}",
             annotation_position="right",
             annotation_font=dict(color="#FF9800", size=11),
             row=1, col=1,  # type: ignore[arg-type]
@@ -965,10 +966,10 @@ def render_single_stock_page() -> None:
         st.markdown("##### 支撐 / 壓力")
         sr_method = st.radio(
             "計算邏輯",
-            options=["20日極值 (箱型)", "N字轉折 (波段)"],
+            options=["20日極值 (箱型)", "N字轉折 (波段)", "籌碼密集區 (Volume Profile)"],
             horizontal=True,
             key="ss_sr_method",
-            help="20日極值：近20日最高/最低絕對極端；N字轉折：5根滾動視窗波段高低點（排除最後2根避免 look-ahead bias）",
+            help="20日極值：近20日最高/最低絕對極端；N字轉折：5根滾動視窗波段高低點（排除最後2根避免 look-ahead bias）；籌碼密集區：近60日收盤切20格，找累積量最大格的中間值作為大量籌碼區位",
         )
 
         st.markdown("---")
@@ -1047,6 +1048,7 @@ def render_single_stock_page() -> None:
         sup_label      = "支撐區"
         res_card_title = "🔴 近期壓力"
         sup_card_title = "🟢 近期支撐"
+        vp_poc_price: Optional[float] = None   # 籌碼密集區模式專用
 
         if sr_method == "20日極值 (箱型)":
             if "high" in df.columns:
@@ -1058,7 +1060,7 @@ def render_single_stock_page() -> None:
             res_card_title = "🔴 近期箱型壓力（20日最高）"
             sup_card_title = "🟢 近期箱型支撐（20日最低）"
 
-        else:  # N字轉折 (波段)
+        elif sr_method == "N字轉折 (波段)":
             if "high" in df_full.columns and "low" in df_full.columns:
                 sh_series = (df_full["high"]
                              == df_full["high"].rolling(window=5, center=True).max())
@@ -1081,16 +1083,49 @@ def render_single_stock_page() -> None:
             res_card_title = "🔴 前高轉折壓力（Swing High）"
             sup_card_title = "🟢 前低轉折支撐（Swing Low）"
 
-        # ── Volume POC（近 20 日最大量典型價格，獨立於壓力/支撐邏輯）──
-        df_20 = df.tail(20)
+        else:  # 籌碼密集區 (Volume Profile)
+            df_60 = df_full.tail(60)
+            if all(c in df_60.columns for c in ["close", "volume"]) and len(df_60) >= 5:
+                try:
+                    close_bins = pd.cut(df_60["close"], bins=20)
+                    vol_by_bin = df_60.groupby(close_bins, observed=False)["volume"].sum()
+                    poc_bin    = vol_by_bin.idxmax()
+                    vp_poc_price = float(poc_bin.mid)  # type: ignore[union-attr]
+                except Exception:
+                    pass
+            if vp_poc_price is not None and close_now is not None:
+                if close_now > vp_poc_price:
+                    sup_price      = vp_poc_price
+                    sup_card_title = "🟢 籌碼支撐（Volume Profile）"
+                    sup_label      = "籌碼支撐"
+                else:
+                    res_price      = vp_poc_price
+                    res_card_title = "🔴 籌碼壓力（Volume Profile）"
+                    res_label      = "籌碼壓力"
+
+        # ── Volume POC（近 20 日最大量典型價格，僅在非籌碼密集區模式顯示）──
         poc_price: Optional[float] = None
-        if (all(c in df_20.columns for c in ["volume", "high", "low", "close"])
-                and df_20["volume"].notna().any()):
-            max_vol_pos = int(df_20["volume"].argmax())
-            max_vol_row = df_20.iloc[max_vol_pos]
-            poc_price = float(
-                (float(max_vol_row["high"]) + float(max_vol_row["low"]) + float(max_vol_row["close"])) / 3
-            )
+        if sr_method != "籌碼密集區 (Volume Profile)":
+            df_20 = df.tail(20)
+            if (all(c in df_20.columns for c in ["volume", "high", "low", "close"])
+                    and df_20["volume"].notna().any()):
+                max_vol_pos = int(df_20["volume"].argmax())
+                max_vol_row = df_20.iloc[max_vol_pos]
+                poc_price = float(
+                    (float(max_vol_row["high"]) + float(max_vol_row["low"]) + float(max_vol_row["close"])) / 3
+                )
+
+        # ── 為圖表建立繪製變數（VP 模式：橙色實線取代紅/綠虛線）──────────
+        if sr_method == "籌碼密集區 (Volume Profile)":
+            _chart_res   = None
+            _chart_sup   = None
+            _chart_poc   = vp_poc_price
+            _poc_label   = "最大籌碼成本區"
+        else:
+            _chart_res   = res_price
+            _chart_sup   = sup_price
+            _chart_poc   = poc_price
+            _poc_label   = "大量籌碼區"
 
         # ── 最新報價指標卡 ─────────────────────────
         m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -1159,13 +1194,13 @@ def render_single_stock_page() -> None:
             )
 
         # ── 近期支撐與壓力卡片 ──────────────────────────────────────
-        if res_price is not None and sup_price is not None and close_now is not None:
-            st.markdown("##### 🎯 近期支撐與壓力（近 20 日區間）")
-            res_pct = (res_price - close_now) / close_now * 100
-            sup_pct = (sup_price - close_now) / close_now * 100
+        if (res_price is not None or sup_price is not None) and close_now is not None:
+            st.markdown("##### 🎯 近期支撐與壓力")
             col_res, col_sup, col_poc = st.columns(3)
             with col_res:
-                st.markdown(f"""
+                if res_price is not None:
+                    res_pct = (res_price - close_now) / close_now * 100
+                    st.markdown(f"""
 <div style="border:1.5px solid #EF5350;border-radius:10px;padding:14px 16px;
 background:#FFEBEE;text-align:center;">
   <div style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">
@@ -1179,7 +1214,9 @@ background:#FFEBEE;text-align:center;">
   </div>
 </div>""", unsafe_allow_html=True)
             with col_sup:
-                st.markdown(f"""
+                if sup_price is not None:
+                    sup_pct = (sup_price - close_now) / close_now * 100
+                    st.markdown(f"""
 <div style="border:1.5px solid #2E7D32;border-radius:10px;padding:14px 16px;
 background:#E8F5E9;text-align:center;">
   <div style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">
@@ -1217,11 +1254,12 @@ background:#FFF8E1;text-align:center;">
             show_bb=show_bb,
             show_rsi=show_rsi,
             show_macd=show_macd,
-            res_price=res_price,
-            sup_price=sup_price,
-            poc_price=poc_price,
+            res_price=_chart_res,
+            sup_price=_chart_sup,
+            poc_price=_chart_poc,
             res_label=res_label,
             sup_label=sup_label,
+            poc_label=_poc_label,
         )
         render_data_table(df, symbol)
 
