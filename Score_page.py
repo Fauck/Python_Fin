@@ -397,10 +397,10 @@ def render_radar_chart(score_result: Dict[str, Any]) -> None:
         ),
         showlegend=False,
         height=340,
-        margin=dict(l=60, r=60, t=20, b=20),
+        margin=dict(l=10, r=10, t=20, b=10),
         paper_bgcolor="white",
     )
-    st.plotly_chart(fig)
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # ─────────────────────────────────────────────
@@ -409,17 +409,13 @@ def render_radar_chart(score_result: Dict[str, Any]) -> None:
 
 def render_score_page() -> None:
     """個股綜合評分頁面（雙模式 100 分制買進指標）。"""
-    ctrl_col, result_col = st.columns([1, 3], gap="large")
-
-    with ctrl_col:
-        st.markdown("#### 查詢條件")
+    with st.expander("🔍 查詢條件設定與操作", expanded=True):
         symbol = st.text_input(
             "股票代號", value="2330", max_chars=10,
             key="score_page_symbol",
             help="輸入台灣股票代號，例如 2330（台積電）",
         ).strip()
 
-        st.markdown("##### 投資策略模式")
         mode = st.radio(
             "投資策略模式",
             options=[MODE_A, MODE_B],
@@ -429,103 +425,99 @@ def render_score_page() -> None:
                 "🏦 長線資產累積"
             ),
             key="score_page_mode",
-            label_visibility="collapsed",
+            horizontal=True,
         )
 
         if mode == MODE_A:
             st.caption(
-                "追強勢策略\n"
-                "趨勢 40% ＋ 動能 30% ＋ 量能 30%\n"
-                "適合個股突破進場"
+                "追強勢策略｜趨勢 40% ＋ 動能 30% ＋ 量能 30%｜適合個股突破進場"
             )
         else:
             st.caption(
-                "左側交易策略\n"
-                "價格位階 40% ＋ 超賣指標 40% ＋ 長線基期 20%\n"
-                "20 年期以上 / 大盤 ETF 定期定額"
+                "左側交易策略｜價格位階 40% ＋ 超賣指標 40% ＋ 長線基期 20%"
+                "｜20 年期以上 / 大盤 ETF 定期定額"
             )
 
         query_btn = st.button("開始評分", type="primary", use_container_width=True)
 
-    with result_col:
-        if not query_btn:
-            st.info("請在左側選擇投資策略模式並輸入股票代號，點擊「開始評分」。")
-            return
+    if not query_btn:
+        st.info("請在上方選擇投資策略模式並輸入股票代號，點擊「開始評分」。")
+        return
 
-        if not symbol:
-            st.error("股票代號不得為空，請重新輸入。")
-            return
+    if not symbol:
+        st.error("股票代號不得為空，請重新輸入。")
+        return
 
-        with st.spinner(f"正在分析 {symbol}…"):
-            try:
-                df_full = fetch_stock_candles(
-                    symbol=symbol,
-                    limit=_SCORE_FETCH_LIMIT,
-                    fields="open,high,low,close,volume",
-                )
-            except ValueError as e:
-                st.error(str(e))
-                return
-            except Exception as e:
-                st.error(f"API 呼叫失敗：{e}\n\n請確認股票代號是否正確，或稍後再試。")
-                return
-
-        if df_full.empty:
-            st.warning(f"查無 **{symbol}** 的資料，請確認代號是否正確。")
-            return
-
-        # ── 模式 B：計算殖利率加分 ──────────────────
-        yield_bonus = 0
-        if mode == MODE_B and not df_full.empty:
-            try:
-                div_data = fetch_dividends(symbol)
-                if div_data is not None:
-                    avg_cash      = div_data["avg_cash_3yr"]
-                    current_close = float(df_full["close"].iloc[-1])
-                    if current_close > 0 and avg_cash / current_close * 100 >= 5.0:
-                        yield_bonus = 10
-            except Exception:
-                yield_bonus = 0
-
-        if mode == MODE_A:
-            score_result = compute_score_mode_a(df_full)
-        else:
-            score_result = compute_score_mode_b(df_full, yield_bonus=yield_bonus)
-
-        if score_result is None:
-            st.warning(
-                f"**{symbol}** 歷史資料不足（需至少 65 個交易日），無法進行評分。"
+    with st.spinner(f"正在分析 {symbol}…"):
+        try:
+            df_full = fetch_stock_candles(
+                symbol=symbol,
+                limit=_SCORE_FETCH_LIMIT,
+                fields="open,high,low,close,volume",
             )
+        except ValueError as e:
+            st.error(str(e))
+            return
+        except Exception as e:
+            st.error(f"API 呼叫失敗：{e}\n\n請確認股票代號是否正確，或稍後再試。")
             return
 
-        total      = int(score_result["total"])
-        mode_label = (
-            "📈 短線動能與波段操作（適合個股突破）" if mode == MODE_A
-            else "🏦 長線資產累積（20 年期以上 / 適合大盤 ETF 定期定額）"
+    if df_full.empty:
+        st.warning(f"查無 **{symbol}** 的資料，請確認代號是否正確。")
+        return
+
+    # ── 模式 B：計算殖利率加分 ──────────────────
+    yield_bonus = 0
+    if mode == MODE_B and not df_full.empty:
+        try:
+            div_data = fetch_dividends(symbol)
+            if div_data is not None:
+                avg_cash      = div_data["avg_cash_3yr"]
+                current_close = float(df_full["close"].iloc[-1])
+                if current_close > 0 and avg_cash / current_close * 100 >= 5.0:
+                    yield_bonus = 10
+        except Exception:
+            yield_bonus = 0
+
+    if mode == MODE_A:
+        score_result = compute_score_mode_a(df_full)
+    else:
+        score_result = compute_score_mode_b(df_full, yield_bonus=yield_bonus)
+
+    if score_result is None:
+        st.warning(
+            f"**{symbol}** 歷史資料不足（需至少 65 個交易日），無法進行評分。"
+        )
+        return
+
+    total      = int(score_result["total"])
+    mode_label = (
+        "📈 短線動能與波段操作（適合個股突破）" if mode == MODE_A
+        else "🏦 長線資產累積（20 年期以上 / 適合大盤 ETF 定期定額）"
+    )
+
+    # ── 提示語（依模式 + 分段）────────────────
+    if total >= 80:
+        score_color = "#4CAF50"
+        score_hint  = (
+            "技術面強勢，適合右側順勢進場。" if mode == MODE_A
+            else "長線基期偏低，為優良的累積單位數時機。"
+        )
+    elif total >= 50:
+        score_color = "#FF9800"
+        score_hint  = (
+            "技術面中性，等待更明確突破信號。" if mode == MODE_A
+            else "長線價格尚在合理區間，可分批少量佈局。"
+        )
+    else:
+        score_color = "#F44336"
+        score_hint  = (
+            "技術面偏弱，建議觀望。" if mode == MODE_A
+            else "目前尚未進入超值買點，耐心等候回調。"
         )
 
-        # ── 提示語（依模式 + 分段）────────────────
-        if total >= 80:
-            score_color = "#4CAF50"
-            score_hint  = (
-                "技術面強勢，適合右側順勢進場。" if mode == MODE_A
-                else "長線基期偏低，為優良的累積單位數時機。"
-            )
-        elif total >= 50:
-            score_color = "#FF9800"
-            score_hint  = (
-                "技術面中性，等待更明確突破信號。" if mode == MODE_A
-                else "長線價格尚在合理區間，可分批少量佈局。"
-            )
-        else:
-            score_color = "#F44336"
-            score_hint  = (
-                "技術面偏弱，建議觀望。" if mode == MODE_A
-                else "目前尚未進入超值買點，耐心等候回調。"
-            )
-
-        # ── 大字體總分卡 ──────────────────────────
-        st.markdown(f"""
+    # ── 大字體總分卡 ──────────────────────────
+    st.markdown(f"""
 <div style="
     background: linear-gradient(135deg, {score_color}1A, {score_color}0A);
     border-left: 6px solid {score_color};
@@ -549,26 +541,22 @@ def render_score_page() -> None:
   </div>
 </div>""", unsafe_allow_html=True)
 
-        # ── 各維度分數卡片（動態欄數）────────────
-        dims     = score_result["dimensions"]
-        dim_keys = list(dims.keys())
-        metric_cols = st.columns(len(dim_keys))
-        for col, k in zip(metric_cols, dim_keys):
-            col.metric(
-                str(dims[k]["label"]).replace("\n", " "),
-                f"{int(dims[k]['score'])} / {int(dims[k]['max'])}",
-            )
+    # ── 各維度分數卡片（動態欄數）────────────
+    dims     = score_result["dimensions"]
+    dim_keys = list(dims.keys())
+    metric_cols = st.columns(len(dim_keys))
+    for col, k in zip(metric_cols, dim_keys):
+        col.metric(
+            str(dims[k]["label"]).replace("\n", " "),
+            f"{int(dims[k]['score'])} / {int(dims[k]['max'])}",
+        )
 
-        st.markdown("---")
+    st.markdown("---")
 
-        # ── 雷達圖 + 指標明細並排 ──────────────────
-        radar_col, table_col = st.columns([1, 1], gap="large")
+    # ── 雷達圖（上）+ 指標明細（下）────────────
+    st.markdown("##### 評分雷達圖")
+    render_radar_chart(score_result)
 
-        with radar_col:
-            st.markdown("##### 評分雷達圖")
-            render_radar_chart(score_result)
-
-        with table_col:
-            st.markdown("##### 指標明細")
-            detail_df = pd.DataFrame(score_result["details"])
-            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+    st.markdown("##### 指標明細")
+    detail_df = pd.DataFrame(score_result["details"])
+    st.dataframe(detail_df, use_container_width=True, hide_index=True)

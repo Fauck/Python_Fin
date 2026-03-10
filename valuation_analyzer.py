@@ -691,7 +691,7 @@ def build_river_chart(
         paper_bgcolor="white",
         hovermode="x unified",
         legend=dict(orientation="h", y=1.08, x=0, xanchor="left"),
-        margin=dict(l=60, r=80, t=90, b=50),
+        margin=dict(l=10, r=10, t=90, b=10),
         xaxis=dict(showgrid=True, gridcolor="#f0f0f0", tickangle=-30, nticks=12),
         yaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
     )
@@ -795,32 +795,28 @@ def _render_results(cache: Dict[str, Any]) -> None:
     if is_custom:
         st.warning("⚙️ 目前使用**自訂估值倍數**（非歷史統計分位數）", icon="⚠️")
 
-    badge_col, chart_col = st.columns([1, 2.5], gap="large")
+    _render_eval_badge(
+        eval_result   = eval_result,
+        current_price = current_price,
+        current_ratio = band_data["current_ratio"],
+        ratio_name    = band_data["ratio_name"],
+        unit          = band_data["unit"],
+    )
 
-    with badge_col:
-        _render_eval_badge(
-            eval_result   = eval_result,
-            current_price = current_price,
-            current_ratio = band_data["current_ratio"],
-            ratio_name    = band_data["ratio_name"],
-            unit          = band_data["unit"],
-        )
-
-    with chart_col:
-        ratio_brief = band_data["ratio_name"].split("（")[0]
-        suffix      = "自訂倍數" if is_custom else "TTM EPS｜5 等份估值帶"
-        title_str   = (
-            f"{resolved}　{ratio_brief}河流圖"
-            f"（近 {years} 年｜{suffix}）"
-        )
-        fig = build_river_chart(
-            price_df      = data["price_df"],
-            bands_df      = band_data["bands_df"],
-            title         = title_str,
-            current_price = current_price,
-            eval_result   = eval_result,
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    ratio_brief = band_data["ratio_name"].split("（")[0]
+    suffix      = "自訂倍數" if is_custom else "TTM EPS｜5 等份估值帶"
+    title_str   = (
+        f"{resolved}　{ratio_brief}河流圖"
+        f"（近 {years} 年｜{suffix}）"
+    )
+    fig = build_river_chart(
+        price_df      = data["price_df"],
+        bands_df      = band_data["bands_df"],
+        title         = title_str,
+        current_price = current_price,
+        eval_result   = eval_result,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
     # ── 各估值區間價格卡片 ─────────────────────────────────────
     st.markdown("---")
@@ -853,48 +849,46 @@ def _render_results(cache: Dict[str, Any]) -> None:
 def render_valuation_page() -> None:
     """估值分析頁面（Tab 8）。"""
 
-    # ── Upgrade 3：session_state 保存查詢結果 ─────────────────
+    # session_state 保存查詢結果，避免圖表因互動消失
     if "val_cache" not in st.session_state:
         st.session_state["val_cache"] = None
 
-    ctrl_col, result_col = st.columns([1, 3], gap="large")
-
-    # ── 左欄：控制面板 ────────────────────────────────────────
-    with ctrl_col:
-        st.markdown("#### 查詢條件")
-        symbol = st.text_input(
-            "股票代號",
-            value="2330",
-            max_chars=20,
-            key="val_symbol",
-            help=(
-                "台股輸入 4-6 位數字（如 2330），系統自動嘗試 .TW / .TWO。\n"
-                "美股輸入英文代號（如 AAPL）。"
-            ),
-        ).strip()
-
-        years: int = st.select_slider(
-            "歷史年數",
-            options=[3, 4, 5],
-            value=5,
-            key="val_years",
-            help="往前取幾年的歷史資料進行估值區間計算",
-        )
-
-        method = st.selectbox(
-            "估值方法",
-            options=[
-                "📊 本益比河流圖 (P/E)",
-                "📚 淨值比河流圖 (P/B)",
-                "💰 殖利率通道",
-            ],
-            key="val_method",
-            help=(
-                "• P/E：適合有穩定獲利的成長股（使用 TTM 近四季 EPS）\n"
-                "• P/B：適合景氣循環股或金融股\n"
-                "• 殖利率：適合高股息 ETF 或穩定配息標的"
-            ),
-        )
+    # ── 控制面板（expander）────────────────────────────────────
+    with st.expander("🔍 查詢條件設定與操作", expanded=True):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            symbol = st.text_input(
+                "股票代號",
+                value="2330",
+                max_chars=20,
+                key="val_symbol",
+                help=(
+                    "台股輸入 4-6 位數字（如 2330），系統自動嘗試 .TW / .TWO。\n"
+                    "美股輸入英文代號（如 AAPL）。"
+                ),
+            ).strip()
+            years: int = st.select_slider(
+                "歷史年數",
+                options=[3, 4, 5],
+                value=5,
+                key="val_years",
+                help="往前取幾年的歷史資料進行估值區間計算",
+            )
+        with col_b:
+            method = st.selectbox(
+                "估值方法",
+                options=[
+                    "📊 本益比河流圖 (P/E)",
+                    "📚 淨值比河流圖 (P/B)",
+                    "💰 殖利率通道",
+                ],
+                key="val_method",
+                help=(
+                    "• P/E：適合有穩定獲利的成長股（使用 TTM 近四季 EPS）\n"
+                    "• P/B：適合景氣循環股或金融股\n"
+                    "• 殖利率：適合高股息 ETF 或穩定配息標的"
+                ),
+            )
 
         # ── 自訂倍數面板 ──────────────────────────────────────
         with st.expander("⚙️ 進階：自訂估值倍數", expanded=False):
@@ -939,94 +933,91 @@ def render_valuation_page() -> None:
             key="val_query",
         )
 
-    # ── 右欄：結果 ────────────────────────────────────────────
-    with result_col:
+    # ── 按鈕按下 → 計算並存入 session_state ───────────────────
+    if query_btn:
+        if not symbol:
+            st.error("股票代號不得為空。")
+            st.session_state["val_cache"] = None
 
-        # 按鈕按下 → 計算並存入 session_state
-        if query_btn:
-            if not symbol:
-                st.error("股票代號不得為空。")
+        else:
+            with st.spinner(f"正在取得 {symbol} 歷史資料（{years} 年）…"):
+                try:
+                    data = fetch_valuation_data(symbol=symbol, years=years)
+                except Exception as e:
+                    st.error(f"資料抓取失敗：{e}")
+                    st.session_state["val_cache"] = None
+                    data = None
+
+            if data is None:
+                st.warning(
+                    f"查無 **{symbol}** 的歷史資料。\n\n"
+                    "可能原因：代號錯誤、Yahoo Finance 尚未收錄此標的、"
+                    "或目前網路連線不穩定。"
+                )
                 st.session_state["val_cache"] = None
 
             else:
-                with st.spinner(f"正在取得 {symbol} 歷史資料（{years} 年）…"):
-                    try:
-                        data = fetch_valuation_data(symbol=symbol, years=years)
-                    except Exception as e:
-                        st.error(f"資料抓取失敗：{e}")
-                        st.session_state["val_cache"] = None
-                        data = None
+                method_key = (method or "")[:1]
+                _HINTS = {
+                    "📊": (
+                        f"**{data['symbol_full']}** 的本益比河流圖資料不足。\n\n"
+                        "可能原因：\n"
+                        "- Yahoo Finance 未提供此標的的 EPS 季報資料\n"
+                        "- 近期出現虧損（EPS ≤ 0）\n\n"
+                        "建議改用「淨值比河流圖」或「殖利率通道」。"
+                    ),
+                    "📚": (
+                        f"**{data['symbol_full']}** 的淨值比河流圖資料不足。\n\n"
+                        "可能原因：Yahoo Finance 未提供每股淨值季報資料。\n\n"
+                        "建議改用「本益比」或確認代號是否正確。"
+                    ),
+                    "💰": (
+                        f"**{data['symbol_full']}** 近期無配息記錄，"
+                        "無法建立殖利率通道。\n\n"
+                        "建議改用「本益比」或「淨值比」河流圖。"
+                    ),
+                }
 
-                if data is None:
-                    st.warning(
-                        f"查無 **{symbol}** 的歷史資料。\n\n"
-                        "可能原因：代號錯誤、Yahoo Finance 尚未收錄此標的、"
-                        "或目前網路連線不穩定。"
-                    )
+                with st.spinner("正在計算估值帶線…"):
+                    if method_key == "📊":
+                        band_data = compute_pe_bands(data, custom_levels=custom_levels)
+                    elif method_key == "📚":
+                        band_data = compute_pb_bands(data, custom_levels=custom_levels)
+                    else:
+                        band_data = compute_yield_bands(data, custom_levels=custom_levels)
+
+                if band_data is None:
+                    st.warning(_HINTS.get(method_key, "資料不足，無法計算。"))
                     st.session_state["val_cache"] = None
-
                 else:
-                    method_key = (method or "")[:1]
-                    _HINTS = {
-                        "📊": (
-                            f"**{data['symbol_full']}** 的本益比河流圖資料不足。\n\n"
-                            "可能原因：\n"
-                            "- Yahoo Finance 未提供此標的的 EPS 季報資料\n"
-                            "- 近期出現虧損（EPS ≤ 0）\n\n"
-                            "建議改用「淨值比河流圖」或「殖利率通道」。"
-                        ),
-                        "📚": (
-                            f"**{data['symbol_full']}** 的淨值比河流圖資料不足。\n\n"
-                            "可能原因：Yahoo Finance 未提供每股淨值季報資料。\n\n"
-                            "建議改用「本益比」或確認代號是否正確。"
-                        ),
-                        "💰": (
-                            f"**{data['symbol_full']}** 近期無配息記錄，"
-                            "無法建立殖利率通道。\n\n"
-                            "建議改用「本益比」或「淨值比」河流圖。"
-                        ),
+                    eval_result = evaluate_current_price(
+                        data["current_price"], band_data["current_bands"]
+                    )
+                    st.session_state["val_cache"] = {
+                        "data":        data,
+                        "band_data":   band_data,
+                        "eval_result": eval_result,
+                        "years":       years,
+                        "is_custom":   use_custom,
                     }
 
-                    with st.spinner("正在計算估值帶線…"):
-                        if method_key == "📊":
-                            band_data = compute_pe_bands(data, custom_levels=custom_levels)
-                        elif method_key == "📚":
-                            band_data = compute_pb_bands(data, custom_levels=custom_levels)
-                        else:
-                            band_data = compute_yield_bands(data, custom_levels=custom_levels)
+    # ── 從 session_state 渲染（即使沒有按按鈕也能保留圖表）───────
+    cache = st.session_state.get("val_cache")
 
-                    if band_data is None:
-                        st.warning(_HINTS.get(method_key, "資料不足，無法計算。"))
-                        st.session_state["val_cache"] = None
-                    else:
-                        eval_result = evaluate_current_price(
-                            data["current_price"], band_data["current_bands"]
-                        )
-                        st.session_state["val_cache"] = {
-                            "data":        data,
-                            "band_data":   band_data,
-                            "eval_result": eval_result,
-                            "years":       years,
-                            "is_custom":   use_custom,
-                        }
-
-        # 從 session_state 渲染（即使沒有按按鈕也能保留圖表）
-        cache = st.session_state.get("val_cache")
-
-        if cache is None and not query_btn:
-            st.info(
-                "請在左側輸入股票代號，選擇估值方法後點擊「查詢估值」。\n\n"
-                "**三種估值方法說明**\n\n"
-                "| 方法 | 適用標的 |\n"
-                "|------|----------|\n"
-                "| 本益比河流 (P/E) | 成長股、科技股、有穩定 EPS 者 |\n"
-                "| 淨值比河流 (P/B) | 金融股、景氣循環股、資產股 |\n"
-                "| 殖利率通道 | 高股息 ETF（0056、00878）、配息穩定存股標的 |\n\n"
-                "**升級說明**\n\n"
-                "- P/E 帶線採用 **TTM（近四季滾動 EPS）**，呈現平滑波浪而非階梯\n"
-                "- 配息資料優先使用 **Fugle API**（台股），準確度更高\n"
-                "- 圖表縮放、互動後結果**不會消失**（session_state 保存）\n\n"
-                "**資料來源：** Yahoo Finance (yfinance) ＋ Fugle Market Data API"
-            )
-        elif cache is not None:
-            _render_results(cache)
+    if cache is None and not query_btn:
+        st.info(
+            "請在上方輸入股票代號，選擇估值方法後點擊「查詢估值」。\n\n"
+            "**三種估值方法說明**\n\n"
+            "| 方法 | 適用標的 |\n"
+            "|------|----------|\n"
+            "| 本益比河流 (P/E) | 成長股、科技股、有穩定 EPS 者 |\n"
+            "| 淨值比河流 (P/B) | 金融股、景氣循環股、資產股 |\n"
+            "| 殖利率通道 | 高股息 ETF（0056、00878）、配息穩定存股標的 |\n\n"
+            "**升級說明**\n\n"
+            "- P/E 帶線採用 **TTM（近四季滾動 EPS）**，呈現平滑波浪而非階梯\n"
+            "- 配息資料優先使用 **Fugle API**（台股），準確度更高\n"
+            "- 圖表縮放、互動後結果**不會消失**（session_state 保存）\n\n"
+            "**資料來源：** Yahoo Finance (yfinance) ＋ Fugle Market Data API"
+        )
+    elif cache is not None:
+        _render_results(cache)

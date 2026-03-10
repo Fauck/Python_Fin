@@ -310,215 +310,206 @@ def _cached_backtest(
 
 def render_backtest_page() -> None:
     """策略歷史回測頁面（Tab 5）。"""
-    ctrl_col, result_col = st.columns([1, 3], gap="large")
+    with st.expander("🔍 查詢條件設定與操作", expanded=True):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            symbol = st.text_input(
+                "股票代號", value="2330", max_chars=10,
+                key="bt_symbol",
+                help="輸入台灣股票代號，例如 2330（台積電）",
+            ).strip()
+            strategy_names = list(_build_strategy_registry().keys())
+            strategy_name  = st.selectbox(
+                "選擇策略",
+                options=strategy_names,
+                key="bt_strategy",
+                help="回測使用各策略的預設參數",
+            )
+            year_label = st.selectbox(
+                "回測期間",
+                options=list(_YEAR_LIMIT.keys()),
+                key="bt_year",
+            )
+        with col_b:
+            take_profit_pct = st.slider(
+                "停利（%）", min_value=5, max_value=50, value=15, step=1,
+                key="bt_tp",
+                help="收盤達買入價 × (1 + 停利%) 時出場",
+            ) / 100.0
+            use_atr_stop = st.checkbox(
+                "ATR 動態停損", value=False,
+                key="bt_atr_stop",
+                help="勾選後改用 ATR(14) 動態停損，取代下方固定停損百分比",
+            )
+            atr_multiplier = st.slider(
+                "ATR 倍數", min_value=1.0, max_value=5.0, value=2.0, step=0.5,
+                key="bt_atr_mult",
+                disabled=not use_atr_stop,
+                help="停損價 = 買入價 − ATR(14) × 倍數",
+            )
+            stop_loss_pct = st.slider(
+                "固定停損（%）", min_value=1, max_value=20, value=5, step=1,
+                key="bt_sl",
+                disabled=use_atr_stop,
+                help="ATR 停損關閉時使用：收盤跌至買入價 × (1 - 停損%) 時出場",
+            ) / 100.0
 
-    with ctrl_col:
-        st.markdown("#### 回測設定")
-        symbol = st.text_input(
-            "股票代號", value="2330", max_chars=10,
-            key="bt_symbol",
-            help="輸入台灣股票代號，例如 2330（台積電）",
-        ).strip()
+        col_c, col_d, col_e = st.columns(3)
+        with col_c:
+            exit_on_ma20 = st.checkbox(
+                "跌破 20MA 出場", value=True,
+                key="bt_ma20_exit",
+                help="收盤跌破 20 日均線時強制出場",
+            )
+        with col_d:
+            max_hold_days = st.number_input(
+                "時間停損（天）", min_value=1, max_value=120, value=20, step=1,
+                key="bt_max_hold",
+                help="持倉超過此交易日數後，無論損益一律以收盤價強制平倉",
+            )
+        with col_e:
+            tx_cost_pct = st.number_input(
+                "雙邊摩擦成本（%）", min_value=0.0, max_value=5.0,
+                value=0.585, step=0.05, format="%.3f",
+                key="bt_tx_cost",
+                help="手續費 0.1425%×2 + 證交稅 0.3% = 0.585%（預設台股標準）",
+            ) / 100.0
 
-        strategy_names = list(_build_strategy_registry().keys())
-        strategy_name  = st.selectbox(
-            "選擇策略",
-            options=strategy_names,
-            key="bt_strategy",
-            help="回測使用各策略的預設參數",
-        )
-
-        year_label = st.selectbox(
-            "回測期間",
-            options=list(_YEAR_LIMIT.keys()),
-            key="bt_year",
-        )
         fetch_limit = _YEAR_LIMIT[year_label]
-
-        st.markdown("---")
-        st.markdown("##### 出場條件")
-
-        take_profit_pct = st.slider(
-            "停利（%）", min_value=5, max_value=50, value=15, step=1,
-            key="bt_tp",
-            help="收盤達買入價 × (1 + 停利%) 時出場",
-        ) / 100.0
-
-        use_atr_stop = st.checkbox(
-            "ATR 動態停損", value=False,
-            key="bt_atr_stop",
-            help="勾選後改用 ATR(14) 動態停損，取代下方固定停損百分比",
-        )
-
-        atr_multiplier = st.slider(
-            "ATR 倍數", min_value=1.0, max_value=5.0, value=2.0, step=0.5,
-            key="bt_atr_mult",
-            disabled=not use_atr_stop,
-            help="停損價 = 買入價 − ATR(14) × 倍數",
-        )
-
-        stop_loss_pct = st.slider(
-            "固定停損（%）", min_value=1, max_value=20, value=5, step=1,
-            key="bt_sl",
-            disabled=use_atr_stop,
-            help="ATR 停損關閉時使用：收盤跌至買入價 × (1 - 停損%) 時出場",
-        ) / 100.0
-
-        exit_on_ma20 = st.checkbox(
-            "跌破 20MA 出場", value=True,
-            key="bt_ma20_exit",
-            help="收盤跌破 20 日均線時強制出場",
-        )
-
-        max_hold_days = st.number_input(
-            "時間停損（最大持倉天數）", min_value=1, max_value=120, value=20, step=1,
-            key="bt_max_hold",
-            help="持倉超過此交易日數後，無論損益一律以收盤價強制平倉",
-        )
-
-        st.markdown("---")
-        st.markdown("##### 交易成本")
-        tx_cost_pct = st.number_input(
-            "雙邊摩擦成本（%）", min_value=0.0, max_value=5.0,
-            value=0.585, step=0.05, format="%.3f",
-            key="bt_tx_cost",
-            help="手續費 0.1425%×2 + 證交稅 0.3% = 0.585%（預設台股標準）",
-        ) / 100.0
 
         run_btn = st.button(
             "開始回測", type="primary", use_container_width=True,
             key="bt_run",
         )
 
-    with result_col:
-        if not run_btn:
-            st.info(
-                "請在左側設定回測條件，點擊「開始回測」。\n\n"
-                "**注意事項**\n"
-                "- 回測為歷史模擬，不代表未來績效\n"
-                "- 策略使用預設參數；進階參數調整請至「選股策略」頁面\n"
-                "- 每筆交易次日開盤進場，無倉位重疊\n"
-                "- 未觸發停利/停損/均線出場者，資料末尾強制平倉"
+    if not run_btn:
+        st.info(
+            "請在上方設定回測條件，點擊「開始回測」。\n\n"
+            "**注意事項**\n"
+            "- 回測為歷史模擬，不代表未來績效\n"
+            "- 策略使用預設參數；進階參數調整請至「選股策略」頁面\n"
+            "- 每筆交易次日開盤進場，無倉位重疊\n"
+            "- 未觸發停利/停損/均線出場者，資料末尾強制平倉"
+        )
+        return
+
+    if not symbol:
+        st.error("股票代號不得為空。")
+        return
+
+    with st.spinner(f"正在執行 {symbol} × {strategy_name} 回測…"):
+        try:
+            result = _cached_backtest(
+                symbol=symbol,
+                fetch_limit=fetch_limit,
+                strategy_name=str(strategy_name),
+                take_profit_pct=take_profit_pct,
+                stop_loss_pct=stop_loss_pct,
+                exit_on_ma20=exit_on_ma20,
+                use_atr_stop=use_atr_stop,
+                atr_multiplier=float(atr_multiplier),
+                tx_cost_pct=float(tx_cost_pct),
+                max_hold_days=int(max_hold_days),
             )
+        except Exception as e:
+            st.error(f"回測失敗：{e}\n\n請確認股票代號是否正確，或稍後再試。")
             return
 
-        if not symbol:
-            st.error("股票代號不得為空。")
-            return
+    total_trades = result["total_trades"]
+    win_rate     = result["win_rate"]
+    total_return = result["total_return"]
+    max_dd       = result["max_drawdown"]
+    sharpe       = result["sharpe"]
+    pf           = result["profit_factor"]
+    max_consec   = result["max_consec_loss"]
+    bh_return    = result.get("bh_return", 0.0)
 
-        with st.spinner(f"正在執行 {symbol} × {strategy_name} 回測…"):
-            try:
-                result = _cached_backtest(
-                    symbol=symbol,
-                    fetch_limit=fetch_limit,
-                    strategy_name=str(strategy_name),
-                    take_profit_pct=take_profit_pct,
-                    stop_loss_pct=stop_loss_pct,
-                    exit_on_ma20=exit_on_ma20,
-                    use_atr_stop=use_atr_stop,
-                    atr_multiplier=float(atr_multiplier),
-                    tx_cost_pct=float(tx_cost_pct),
-                    max_hold_days=int(max_hold_days),
-                )
-            except Exception as e:
-                st.error(f"回測失敗：{e}\n\n請確認股票代號是否正確，或稍後再試。")
-                return
+    # ── KPI 指標卡（第一行）────────────────────────
+    st.markdown(f"##### {symbol} × {strategy_name}（{year_label}）")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("總交易次數", f"{total_trades} 次")
+    m2.metric(
+        "勝率",
+        f"{win_rate:.1f}%",
+        delta=("高勝率 ✅" if win_rate >= 50 else "偏低 ⚠️") if total_trades > 0 else None,
+    )
+    # 累計報酬 vs 買入持有基準對比
+    beat_bh = total_return > bh_return
+    m3.metric(
+        "累計報酬（扣費後）",
+        f"{total_return:.2f}%",
+        delta=(
+            f"B&H {bh_return:.1f}%  ✅ 打敗基準" if beat_bh
+            else f"B&H {bh_return:.1f}%  ⚠️ 落後基準"
+        ) if total_trades > 0 else None,
+        delta_color="normal" if beat_bh else "inverse",
+    )
 
-        total_trades = result["total_trades"]
-        win_rate     = result["win_rate"]
-        total_return = result["total_return"]
-        max_dd       = result["max_drawdown"]
-        sharpe       = result["sharpe"]
-        pf           = result["profit_factor"]
-        max_consec   = result["max_consec_loss"]
-        bh_return    = result.get("bh_return", 0.0)
+    # ── KPI 指標卡（第二行）────────────────────────
+    r1, r2, r3 = st.columns(3)
+    r1.metric("最大回撤 (MDD)", f"{max_dd:.2f}%",
+              delta=("風險低 ✅" if max_dd < 15 else "風險高 ⚠️") if total_trades > 0 else None,
+              delta_color="inverse")
+    r2.metric("夏普比率", f"{sharpe:.2f}",
+              delta=("優秀 ✅" if sharpe >= 1.0 else ("尚可 🟡" if sharpe >= 0 else "不佳 ❌")) if total_trades > 0 else None)
+    pf_str = f"{pf:.2f}" if pf != float("inf") else "∞"
+    r3.metric("獲利因子", pf_str,
+              delta=("良好 ✅" if (pf == float("inf") or pf >= 1.5) else ("偏低 ⚠️")) if total_trades > 0 else None)
 
-        # ── KPI 指標卡（第一行）────────────────────────
-        st.markdown(f"##### {symbol} × {strategy_name}（{year_label}）")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("總交易次數", f"{total_trades} 次")
-        m2.metric(
-            "勝率",
-            f"{win_rate:.1f}%",
-            delta=("高勝率 ✅" if win_rate >= 50 else "偏低 ⚠️") if total_trades > 0 else None,
+    if total_trades == 0:
+        st.warning(
+            "此期間未偵測到任何交易訊號，請嘗試：\n"
+            "- 延長回測期間\n"
+            "- 換一個策略或不同標的"
         )
-        # 累計報酬 vs 買入持有基準對比
-        beat_bh = total_return > bh_return
-        m3.metric(
-            "累計報酬（扣費後）",
-            f"{total_return:.2f}%",
-            delta=(
-                f"B&H {bh_return:.1f}%  ✅ 打敗基準" if beat_bh
-                else f"B&H {bh_return:.1f}%  ⚠️ 落後基準"
-            ) if total_trades > 0 else None,
-            delta_color="normal" if beat_bh else "inverse",
+        return
+
+    if max_consec > 0:
+        st.caption(f"最大連續虧損：{max_consec} 筆")
+
+    # ── 資金曲線 ──────────────────────────────────
+    st.markdown("---")
+    equity_curve = result["equity_curve"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=list(range(len(equity_curve))),
+        y=equity_curve,
+        mode="lines+markers",
+        line=dict(color="#1976D2", width=2),
+        marker=dict(size=5, color="#1976D2"),
+        fill="tozeroy",
+        fillcolor="rgba(25,118,210,0.08)",
+        hovertemplate="第 %{x} 筆交易後<br>資金倍率：%{y:.3f}x<extra></extra>",
+    ))
+    fig.add_hline(
+        y=1.0,
+        line_dash="dash",
+        line_color="#888",
+        annotation_text="初始資金",
+        annotation_position="bottom right",
+    )
+    fig.update_layout(
+        title=dict(text="資金曲線（累積倍率）", font=dict(size=13)),
+        xaxis_title="交易次序",
+        yaxis_title="資金倍率（x）",
+        height=320,
+        margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    fig.update_yaxes(gridcolor="#f0f0f0")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── 交易明細表 ────────────────────────────────
+    st.markdown("---")
+    with st.expander(f"交易明細（共 {total_trades} 筆）", expanded=True):
+        from typing import Any as _Any  # noqa: F401 — re-used alias for fmt dict
+        trades_df = pd.DataFrame(result["trades"])
+        fmt: Dict[str, _Any] = {
+            "買入價": "{:.2f}", "賣出價": "{:.2f}", "損益(%)": "{:.2f}",
+        }
+        st.dataframe(
+            trades_df.style.format(fmt),
+            use_container_width=True,
+            hide_index=True,
         )
-
-        # ── KPI 指標卡（第二行）────────────────────────
-        r1, r2, r3 = st.columns(3)
-        r1.metric("最大回撤 (MDD)", f"{max_dd:.2f}%",
-                  delta=("風險低 ✅" if max_dd < 15 else "風險高 ⚠️") if total_trades > 0 else None,
-                  delta_color="inverse")
-        r2.metric("夏普比率", f"{sharpe:.2f}",
-                  delta=("優秀 ✅" if sharpe >= 1.0 else ("尚可 🟡" if sharpe >= 0 else "不佳 ❌")) if total_trades > 0 else None)
-        pf_str = f"{pf:.2f}" if pf != float("inf") else "∞"
-        r3.metric("獲利因子", pf_str,
-                  delta=("良好 ✅" if (pf == float("inf") or pf >= 1.5) else ("偏低 ⚠️")) if total_trades > 0 else None)
-
-        if total_trades == 0:
-            st.warning(
-                "此期間未偵測到任何交易訊號，請嘗試：\n"
-                "- 延長回測期間\n"
-                "- 換一個策略或不同標的"
-            )
-            return
-
-        if max_consec > 0:
-            st.caption(f"最大連續虧損：{max_consec} 筆")
-
-        # ── 資金曲線 ──────────────────────────────────
-        st.markdown("---")
-        equity_curve = result["equity_curve"]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=list(range(len(equity_curve))),
-            y=equity_curve,
-            mode="lines+markers",
-            line=dict(color="#1976D2", width=2),
-            marker=dict(size=5, color="#1976D2"),
-            fill="tozeroy",
-            fillcolor="rgba(25,118,210,0.08)",
-            hovertemplate="第 %{x} 筆交易後<br>資金倍率：%{y:.3f}x<extra></extra>",
-        ))
-        fig.add_hline(
-            y=1.0,
-            line_dash="dash",
-            line_color="#888",
-            annotation_text="初始資金",
-            annotation_position="bottom right",
-        )
-        fig.update_layout(
-            title=dict(text="資金曲線（累積倍率）", font=dict(size=13)),
-            xaxis_title="交易次序",
-            yaxis_title="資金倍率（x）",
-            height=320,
-            margin=dict(l=50, r=20, t=40, b=40),
-            paper_bgcolor="white",
-            plot_bgcolor="white",
-        )
-        fig.update_yaxes(gridcolor="#f0f0f0")
-        st.plotly_chart(fig, use_container_width=True)
-
-        # ── 交易明細表 ────────────────────────────────
-        st.markdown("---")
-        with st.expander(f"交易明細（共 {total_trades} 筆）", expanded=True):
-            from typing import Any as _Any  # noqa: F401 — re-used alias for fmt dict
-            trades_df = pd.DataFrame(result["trades"])
-            fmt: Dict[str, _Any] = {
-                "買入價": "{:.2f}", "賣出價": "{:.2f}", "損益(%)": "{:.2f}",
-            }
-            st.dataframe(
-                trades_df.style.format(fmt),
-                use_container_width=True,
-                hide_index=True,
-            )

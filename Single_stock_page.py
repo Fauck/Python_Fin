@@ -926,8 +926,8 @@ def render_ohlcv_chart(
         plot_bgcolor="white",
         paper_bgcolor="white",
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=0, r=0, t=40, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=10, r=10, t=30, b=10),
         autosize=True,
     )
     for i in range(1, n_rows + 1):
@@ -943,264 +943,253 @@ def render_ohlcv_chart(
 
 def render_single_stock_page() -> None:
     """單股分析頁面。"""
-    ctrl_col, result_col = st.columns([1, 3], gap="large")
+    with st.expander("🔍 查詢條件設定與操作", expanded=True):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            symbol = st.text_input(
+                "股票代號", value="1815", max_chars=10,
+                key="single_stock_symbol",
+                help="輸入台灣股票代號，例如 1815、2345、0050",
+            ).strip()
+        with col_b:
+            limit = st.number_input(
+                "顯示天數", min_value=1, max_value=60, value=10, step=1,
+                help="最近幾個交易日的資料",
+            )
 
-    with ctrl_col:
-        st.markdown("#### 查詢條件")
-        symbol = st.text_input(
-            "股票代號", value="1815", max_chars=10,
-            key="single_stock_symbol",
-            help="輸入台灣股票代號，例如 1815、2345、0050",
-        ).strip()
-        limit = st.number_input(
-            "顯示天數", min_value=1, max_value=60, value=10, step=1,
-            help="最近幾個交易日的資料",
-        )
-        # 預留：日期區間（未來可取消註解啟用）
-        # st.markdown("---")
-        # st.markdown("##### 自訂日期區間（選填）")
-        # custom_from = st.date_input("起始日期", value=None)
-        # custom_to   = st.date_input("結束日期",  value=None)
-
-        st.markdown("---")
-        st.markdown("##### 支撐 / 壓力")
         sr_method = st.radio(
-            "計算邏輯",
+            "支撐 / 壓力計算邏輯",
             options=["20日極值 (箱型)", "N字轉折 (波段)", "籌碼密集區 (Volume Profile)"],
             horizontal=True,
             key="ss_sr_method",
             help="20日極值：近20日最高/最低絕對極端；N字轉折：5根滾動視窗波段高低點（排除最後2根避免 look-ahead bias）；籌碼密集區：近60日收盤切20格，找累積量最大格的中間值作為大量籌碼區位",
         )
 
-        st.markdown("---")
-        st.markdown("##### 技術指標")
-        show_ma5  = st.checkbox("MA5",         value=True,  key="ss_ma5")
-        show_ma10 = st.checkbox("MA10",        value=True,  key="ss_ma10")
-        show_ma20 = st.checkbox("MA20",        value=True,  key="ss_ma20")
-        show_kd   = st.checkbox("KD（9日）",   value=True,  key="ss_kd")
-        show_bb   = st.checkbox("布林通道",     value=False, key="ss_bb",
-                                help="Bollinger Bands (20,2)；灰底為通道帶寬區域")
-        show_rsi  = st.checkbox("RSI（14）",   value=False, key="ss_rsi",
-                                help="相對強弱指標；70 超買 / 30 超賣")
-        show_macd = st.checkbox("MACD（12,26,9）", value=False, key="ss_macd",
-                                help="DIF / DEA / 柱狀圖")
+        ind_cols = st.columns(7)
+        show_ma5  = ind_cols[0].checkbox("MA5",           value=True,  key="ss_ma5")
+        show_ma10 = ind_cols[1].checkbox("MA10",          value=True,  key="ss_ma10")
+        show_ma20 = ind_cols[2].checkbox("MA20",          value=True,  key="ss_ma20")
+        show_kd   = ind_cols[3].checkbox("KD",            value=True,  key="ss_kd")
+        show_bb   = ind_cols[4].checkbox("布林",          value=False, key="ss_bb")
+        show_rsi  = ind_cols[5].checkbox("RSI",           value=False, key="ss_rsi")
+        show_macd = ind_cols[6].checkbox("MACD",          value=False, key="ss_macd")
 
         query_btn = st.button("查詢", type="primary", use_container_width=True)
 
-    with result_col:
-        if not query_btn:
-            st.info("請在左側輸入股票代號後，點擊「查詢」按鈕。")
+    if not query_btn:
+        st.info("請在上方輸入股票代號後，點擊「查詢」按鈕。")
+        return
+
+    if not symbol:
+        st.error("股票代號不得為空，請重新輸入。")
+        return
+
+    # 決定需要哪些 MA 期數
+    ma_periods = [p for p, flag in [(5, show_ma5), (10, show_ma10), (20, show_ma20)] if flag]
+
+    # 計算指標需要額外的暖機資料
+    # MACD slow=26 需 26 筆，Bollinger period=20，RSI period=14
+    # 季線（60MA）扣抵值計算需至少 60 筆，故 fetch_limit 至少取 120
+    warmup = max([0] + ma_periods + ([9] if show_kd else []) +
+                 ([26] if show_macd else []) + ([20] if show_bb else []) +
+                 ([14] if show_rsi else [])) + 30
+    fetch_limit = max(int(limit) + warmup, 120)
+
+    with st.spinner(f"正在取得 {symbol} 的歷史資料…"):
+        try:
+            df_full = fetch_stock_candles(
+                symbol=symbol,
+                limit=fetch_limit,
+                fields="open,high,low,close,volume,turnover",
+            )
+        except ValueError as e:
+            st.error(str(e))
+            return
+        except Exception as e:
+            st.error(f"API 呼叫失敗：{e}\n\n請確認股票代號是否正確，或稍後再試。")
             return
 
-        if not symbol:
-            st.error("股票代號不得為空，請重新輸入。")
-            return
+    if df_full.empty:
+        st.warning(f"查無 **{symbol}** 的資料，請確認代號是否正確。")
+        return
 
-        # 決定需要哪些 MA 期數
-        ma_periods = [p for p, flag in [(5, show_ma5), (10, show_ma10), (20, show_ma20)] if flag]
+    # 在完整資料上計算指標（保留 warmup 確保準確性）
+    # 進場訊號分析固定需要所有指標，一次計算完畢
+    df_full = compute_ma(df_full, [5, 10, 20, 60])   # 含季線，進場訊號守門需要
+    df_full = compute_kd(df_full)
+    df_full = compute_rsi(df_full)
+    df_full = compute_macd(df_full)
+    df_full = compute_bollinger(df_full)
 
-        # 計算指標需要額外的暖機資料
-        # MACD slow=26 需 26 筆，Bollinger period=20，RSI period=14
-        # 季線（60MA）扣抵值計算需至少 60 筆，故 fetch_limit 至少取 120
-        warmup = max([0] + ma_periods + ([9] if show_kd else []) +
-                     ([26] if show_macd else []) + ([20] if show_bb else []) +
-                     ([14] if show_rsi else [])) + 30
-        fetch_limit = max(int(limit) + warmup, 120)
+    # 裁切至使用者指定的顯示天數
+    df = df_full.tail(int(limit)).reset_index(drop=True)
 
-        with st.spinner(f"正在取得 {symbol} 的歷史資料…"):
-            try:
-                df_full = fetch_stock_candles(
-                    symbol=symbol,
-                    limit=fetch_limit,
-                    fields="open,high,low,close,volume,turnover",
-                )
-            except ValueError as e:
-                st.error(str(e))
-                return
-            except Exception as e:
-                st.error(f"API 呼叫失敗：{e}\n\n請確認股票代號是否正確，或稍後再試。")
-                return
+    latest      = df.iloc[-1]
+    prev        = df.iloc[-2] if len(df) >= 2 else latest
+    price_delta = float(latest["close"]) - float(prev["close"]) if "close" in df.columns else 0
 
-        if df_full.empty:
-            st.warning(f"查無 **{symbol}** 的資料，請確認代號是否正確。")
-            return
+    # ── 近期壓力 / 支撐（依使用者選擇的計算邏輯）────────────────────
+    close_now: Optional[float] = float(latest["close"]) if "close" in df.columns else None
+    res_price: Optional[float] = None
+    sup_price: Optional[float] = None
+    res_label      = "壓力區"
+    sup_label      = "支撐區"
+    res_card_title = "🔴 近期壓力"
+    sup_card_title = "🟢 近期支撐"
+    vp_poc_price: Optional[float] = None   # 籌碼密集區模式專用
 
-        # 在完整資料上計算指標（保留 warmup 確保準確性）
-        # 進場訊號分析固定需要所有指標，一次計算完畢
-        df_full = compute_ma(df_full, [5, 10, 20, 60])   # 含季線，進場訊號守門需要
-        df_full = compute_kd(df_full)
-        df_full = compute_rsi(df_full)
-        df_full = compute_macd(df_full)
-        df_full = compute_bollinger(df_full)
+    if sr_method == "20日極值 (箱型)":
+        if "high" in df.columns:
+            res_price = float(df["high"].tail(20).max())
+        if "low"  in df.columns:
+            sup_price = float(df["low"].tail(20).min())
+        res_label      = "箱型壓力"
+        sup_label      = "箱型支撐"
+        res_card_title = "🔴 近期箱型壓力（20日最高）"
+        sup_card_title = "🟢 近期箱型支撐（20日最低）"
 
-        # 裁切至使用者指定的顯示天數
-        df = df_full.tail(int(limit)).reset_index(drop=True)
-
-        latest      = df.iloc[-1]
-        prev        = df.iloc[-2] if len(df) >= 2 else latest
-        price_delta = float(latest["close"]) - float(prev["close"]) if "close" in df.columns else 0
-
-        # ── 近期壓力 / 支撐（依使用者選擇的計算邏輯）────────────────────
-        close_now: Optional[float] = float(latest["close"]) if "close" in df.columns else None
-        res_price: Optional[float] = None
-        sup_price: Optional[float] = None
-        res_label      = "壓力區"
-        sup_label      = "支撐區"
-        res_card_title = "🔴 近期壓力"
-        sup_card_title = "🟢 近期支撐"
-        vp_poc_price: Optional[float] = None   # 籌碼密集區模式專用
-
-        if sr_method == "20日極值 (箱型)":
-            if "high" in df.columns:
+    elif sr_method == "N字轉折 (波段)":
+        if "high" in df_full.columns and "low" in df_full.columns:
+            sh_series = (df_full["high"]
+                         == df_full["high"].rolling(window=5, center=True).max())
+            sl_series = (df_full["low"]
+                         == df_full["low"].rolling(window=5, center=True).min())
+            # 排除最後 2 根（右側視窗尚未成型），避免 look-ahead bias
+            sh_true_idx = sh_series.iloc[:-2][sh_series.iloc[:-2]].index
+            sl_true_idx = sl_series.iloc[:-2][sl_series.iloc[:-2]].index
+            # 退避：找不到轉折點時退回 20 日極值
+            if len(sh_true_idx) > 0:
+                res_price = float(df_full.loc[sh_true_idx[-1], "high"])  # type: ignore[arg-type]
+            elif "high" in df.columns:
                 res_price = float(df["high"].tail(20).max())
-            if "low"  in df.columns:
+            if len(sl_true_idx) > 0:
+                sup_price = float(df_full.loc[sl_true_idx[-1], "low"])  # type: ignore[arg-type]
+            elif "low" in df.columns:
                 sup_price = float(df["low"].tail(20).min())
-            res_label      = "箱型壓力"
-            sup_label      = "箱型支撐"
-            res_card_title = "🔴 近期箱型壓力（20日最高）"
-            sup_card_title = "🟢 近期箱型支撐（20日最低）"
+        res_label      = "轉折壓力"
+        sup_label      = "轉折支撐"
+        res_card_title = "🔴 前高轉折壓力（Swing High）"
+        sup_card_title = "🟢 前低轉折支撐（Swing Low）"
 
-        elif sr_method == "N字轉折 (波段)":
-            if "high" in df_full.columns and "low" in df_full.columns:
-                sh_series = (df_full["high"]
-                             == df_full["high"].rolling(window=5, center=True).max())
-                sl_series = (df_full["low"]
-                             == df_full["low"].rolling(window=5, center=True).min())
-                # 排除最後 2 根（右側視窗尚未成型），避免 look-ahead bias
-                sh_true_idx = sh_series.iloc[:-2][sh_series.iloc[:-2]].index
-                sl_true_idx = sl_series.iloc[:-2][sl_series.iloc[:-2]].index
-                # 退避：找不到轉折點時退回 20 日極值
-                if len(sh_true_idx) > 0:
-                    res_price = float(df_full.loc[sh_true_idx[-1], "high"])  # type: ignore[arg-type]
-                elif "high" in df.columns:
-                    res_price = float(df["high"].tail(20).max())
-                if len(sl_true_idx) > 0:
-                    sup_price = float(df_full.loc[sl_true_idx[-1], "low"])  # type: ignore[arg-type]
-                elif "low" in df.columns:
-                    sup_price = float(df["low"].tail(20).min())
-            res_label      = "轉折壓力"
-            sup_label      = "轉折支撐"
-            res_card_title = "🔴 前高轉折壓力（Swing High）"
-            sup_card_title = "🟢 前低轉折支撐（Swing Low）"
+    else:  # 籌碼密集區 (Volume Profile)
+        df_60 = df_full.tail(60)
+        if all(c in df_60.columns for c in ["close", "volume"]) and len(df_60) >= 5:
+            try:
+                close_bins = pd.cut(df_60["close"], bins=20)
+                vol_by_bin = df_60.groupby(close_bins, observed=False)["volume"].sum()
+                poc_bin    = vol_by_bin.idxmax()
+                vp_poc_price = float(poc_bin.mid)  # type: ignore[union-attr]
+            except Exception:
+                pass
+        if vp_poc_price is not None and close_now is not None:
+            if close_now > vp_poc_price:
+                sup_price      = vp_poc_price
+                sup_card_title = "🟢 籌碼支撐（Volume Profile）"
+                sup_label      = "籌碼支撐"
+            else:
+                res_price      = vp_poc_price
+                res_card_title = "🔴 籌碼壓力（Volume Profile）"
+                res_label      = "籌碼壓力"
 
-        else:  # 籌碼密集區 (Volume Profile)
-            df_60 = df_full.tail(60)
-            if all(c in df_60.columns for c in ["close", "volume"]) and len(df_60) >= 5:
-                try:
-                    close_bins = pd.cut(df_60["close"], bins=20)
-                    vol_by_bin = df_60.groupby(close_bins, observed=False)["volume"].sum()
-                    poc_bin    = vol_by_bin.idxmax()
-                    vp_poc_price = float(poc_bin.mid)  # type: ignore[union-attr]
-                except Exception:
-                    pass
-            if vp_poc_price is not None and close_now is not None:
-                if close_now > vp_poc_price:
-                    sup_price      = vp_poc_price
-                    sup_card_title = "🟢 籌碼支撐（Volume Profile）"
-                    sup_label      = "籌碼支撐"
-                else:
-                    res_price      = vp_poc_price
-                    res_card_title = "🔴 籌碼壓力（Volume Profile）"
-                    res_label      = "籌碼壓力"
+    # ── Volume POC（近 20 日最大量典型價格，僅在非籌碼密集區模式顯示）──
+    poc_price: Optional[float] = None
+    if sr_method != "籌碼密集區 (Volume Profile)":
+        df_20 = df.tail(20)
+        if (all(c in df_20.columns for c in ["volume", "high", "low", "close"])
+                and df_20["volume"].notna().any()):
+            max_vol_pos = int(df_20["volume"].argmax())
+            max_vol_row = df_20.iloc[max_vol_pos]
+            poc_price = float(
+                (float(max_vol_row["high"]) + float(max_vol_row["low"]) + float(max_vol_row["close"])) / 3
+            )
 
-        # ── Volume POC（近 20 日最大量典型價格，僅在非籌碼密集區模式顯示）──
-        poc_price: Optional[float] = None
-        if sr_method != "籌碼密集區 (Volume Profile)":
-            df_20 = df.tail(20)
-            if (all(c in df_20.columns for c in ["volume", "high", "low", "close"])
-                    and df_20["volume"].notna().any()):
-                max_vol_pos = int(df_20["volume"].argmax())
-                max_vol_row = df_20.iloc[max_vol_pos]
-                poc_price = float(
-                    (float(max_vol_row["high"]) + float(max_vol_row["low"]) + float(max_vol_row["close"])) / 3
-                )
+    # ── 為圖表建立繪製變數（VP 模式：橙色實線取代紅/綠虛線）──────────
+    if sr_method == "籌碼密集區 (Volume Profile)":
+        _chart_res   = None
+        _chart_sup   = None
+        _chart_poc   = vp_poc_price
+        _poc_label   = "最大籌碼成本區"
+    else:
+        _chart_res   = res_price
+        _chart_sup   = sup_price
+        _chart_poc   = poc_price
+        _poc_label   = "大量籌碼區"
 
-        # ── 為圖表建立繪製變數（VP 模式：橙色實線取代紅/綠虛線）──────────
-        if sr_method == "籌碼密集區 (Volume Profile)":
-            _chart_res   = None
-            _chart_sup   = None
-            _chart_poc   = vp_poc_price
-            _poc_label   = "最大籌碼成本區"
-        else:
-            _chart_res   = res_price
-            _chart_sup   = sup_price
-            _chart_poc   = poc_price
-            _poc_label   = "大量籌碼區"
+    # ── 最新報價指標卡（2 排 × 3 欄，手機友善）────────────────────
+    mr1, mr2, mr3 = st.columns(3)
+    mr4, mr5, mr6 = st.columns(3)
+    if "close"    in df.columns: mr1.metric("收盤價",        f"{latest['close']:,.2f}",   f"{price_delta:+.2f}")
+    if "open"     in df.columns: mr2.metric("開盤價",        f"{latest['open']:,.2f}")
+    if "high"     in df.columns: mr3.metric("最高價",        f"{latest['high']:,.2f}")
+    if "low"      in df.columns: mr4.metric("最低價",        f"{latest['low']:,.2f}")
+    if "volume"   in df.columns: mr5.metric("成交量（張）",   f"{int(latest['volume']):,}")
+    if "turnover" in df.columns: mr6.metric("成交值（千元）", f"{int(latest['turnover']):,}")
 
-        # ── 最新報價指標卡 ─────────────────────────
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        if "close"    in df.columns: m1.metric("收盤價",        f"{latest['close']:,.2f}",   f"{price_delta:+.2f}")
-        if "open"     in df.columns: m2.metric("開盤價",        f"{latest['open']:,.2f}")
-        if "high"     in df.columns: m3.metric("最高價",        f"{latest['high']:,.2f}")
-        if "low"      in df.columns: m4.metric("最低價",        f"{latest['low']:,.2f}")
-        if "volume"   in df.columns: m5.metric("成交量（張）",   f"{int(latest['volume']):,}")
-        if "turnover" in df.columns: m6.metric("成交值（千元）", f"{int(latest['turnover']):,}")
-
-        # ── 技術指標快訊（RSI / MACD / KD 數值）─────
-        has_rsi  = "rsi_14"    in df.columns
-        has_macd = "macd_hist" in df.columns
-        has_kd   = "k_val"     in df.columns
-        has_bb   = "bb_upper"  in df.columns
-        if any([has_rsi, has_macd, has_kd, has_bb]):
-            n_info = sum([has_rsi, has_macd, has_kd, has_bb])
-            info_cols = st.columns(n_info)
-            ic = 0
-            if has_rsi:
-                rsi_v = float(latest["rsi_14"])
-                rsi_label = "超買" if rsi_v > 70 else ("超賣" if rsi_v < 30 else "正常")
-                info_cols[ic].metric("RSI(14)", f"{rsi_v:.1f}", rsi_label)
-                ic += 1
-            if has_macd:
-                hist_v = float(latest["macd_hist"])
-                info_cols[ic].metric("MACD 柱", f"{hist_v:+.3f}",
+    # ── 技術指標快訊（RSI / MACD / KD 數值）─────
+    has_rsi  = "rsi_14"    in df.columns
+    has_macd = "macd_hist" in df.columns
+    has_kd   = "k_val"     in df.columns
+    has_bb   = "bb_upper"  in df.columns
+    if any([has_rsi, has_macd, has_kd, has_bb]):
+        n_info = sum([has_rsi, has_macd, has_kd, has_bb])
+        info_cols = st.columns(min(n_info, 3))
+        ic = 0
+        if has_rsi:
+            rsi_v = float(latest["rsi_14"])
+            rsi_label = "超買" if rsi_v > 70 else ("超賣" if rsi_v < 30 else "正常")
+            info_cols[ic % 3].metric("RSI(14)", f"{rsi_v:.1f}", rsi_label)
+            ic += 1
+        if has_macd:
+            hist_v = float(latest["macd_hist"])
+            info_cols[ic % 3].metric("MACD 柱", f"{hist_v:+.3f}",
                                      "多頭" if hist_v > 0 else "空頭")
-                ic += 1
-            if has_kd:
-                k_v = float(latest["k_val"])
-                d_v = float(latest["d_val"])
-                info_cols[ic].metric("KD",
+            ic += 1
+        if has_kd:
+            k_v = float(latest["k_val"])
+            d_v = float(latest["d_val"])
+            info_cols[ic % 3].metric("KD",
                                      f"K {k_v:.1f} / D {d_v:.1f}",
                                      "黃金" if k_v > d_v else "死亡")
-                ic += 1
-            if has_bb:
-                bb_w = float(latest["bb_width"]) if "bb_width" in df.columns else 0
-                info_cols[ic].metric("BB 帶寬", f"{bb_w:.3f}",
+            ic += 1
+        if has_bb:
+            bb_w = float(latest["bb_width"]) if "bb_width" in df.columns else 0
+            info_cols[ic % 3].metric("BB 帶寬", f"{bb_w:.3f}",
                                      "擠壓" if bb_w < df["bb_width"].quantile(0.2) else "正常")
 
-        # ── K 線型態快訊（酒田戰法，pandas-ta cdl_pattern）────────────
-        cdl_patterns = detect_all_candlestick_patterns(df_full)
-        if cdl_patterns:
-            badges = []
-            for p in cdl_patterns:
-                is_bull = p.startswith("🟢")
-                color   = "#2E7D32" if is_bull else "#C62828"
-                bg      = "#E8F5E9" if is_bull else "#FFEBEE"
-                badges.append(
-                    f'<span style="display:inline-block;background:{bg};'
-                    f'border:1.5px solid {color};border-radius:6px;'
-                    f'padding:4px 12px;margin:3px 4px;font-size:14px;'
-                    f'font-weight:600;color:{color};">{p}</span>'
-                )
-            st.markdown(
-                '<div style="margin:6px 0;"><b>🕯️ 今日 K 線型態</b><br>'
-                + "".join(badges) + "</div>",
-                unsafe_allow_html=True,
+    # ── K 線型態快訊（酒田戰法，pandas-ta cdl_pattern）────────────
+    cdl_patterns = detect_all_candlestick_patterns(df_full)
+    if cdl_patterns:
+        badges = []
+        for p in cdl_patterns:
+            is_bull = p.startswith("🟢")
+            color   = "#2E7D32" if is_bull else "#C62828"
+            bg      = "#E8F5E9" if is_bull else "#FFEBEE"
+            badges.append(
+                f'<span style="display:inline-block;background:{bg};'
+                f'border:1.5px solid {color};border-radius:6px;'
+                f'padding:4px 12px;margin:3px 4px;font-size:14px;'
+                f'font-weight:600;color:{color};">{p}</span>'
             )
-        else:
-            st.markdown(
-                '<p style="font-size:13px;color:#999;margin:6px 0;">'
-                "➖ 今日無特殊 K 線型態</p>",
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            '<div style="margin:6px 0;"><b>🕯️ 今日 K 線型態</b><br>'
+            + "".join(badges) + "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<p style="font-size:13px;color:#999;margin:6px 0;">'
+            "➖ 今日無特殊 K 線型態</p>",
+            unsafe_allow_html=True,
+        )
 
-        # ── 近期支撐與壓力卡片 ──────────────────────────────────────
-        if (res_price is not None or sup_price is not None) and close_now is not None:
-            st.markdown("##### 🎯 近期支撐與壓力")
-            col_res, col_sup, col_poc = st.columns(3)
-            with col_res:
-                if res_price is not None:
-                    res_pct = (res_price - close_now) / close_now * 100
-                    st.markdown(f"""
+    # ── 近期支撐與壓力卡片 ──────────────────────────────────────
+    if (res_price is not None or sup_price is not None) and close_now is not None:
+        st.markdown("##### 🎯 近期支撐與壓力")
+        col_res, col_sup, col_poc = st.columns(3)
+        with col_res:
+            if res_price is not None:
+                res_pct = (res_price - close_now) / close_now * 100
+                st.markdown(f"""
 <div style="border:1.5px solid #EF5350;border-radius:10px;padding:14px 16px;
 background:#FFEBEE;text-align:center;">
   <div style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">
@@ -1213,10 +1202,10 @@ background:#FFEBEE;text-align:center;">
     距現價 <b>{res_pct:+.2f}%</b>（突破即轉強）
   </div>
 </div>""", unsafe_allow_html=True)
-            with col_sup:
-                if sup_price is not None:
-                    sup_pct = (sup_price - close_now) / close_now * 100
-                    st.markdown(f"""
+        with col_sup:
+            if sup_price is not None:
+                sup_pct = (sup_price - close_now) / close_now * 100
+                st.markdown(f"""
 <div style="border:1.5px solid #2E7D32;border-radius:10px;padding:14px 16px;
 background:#E8F5E9;text-align:center;">
   <div style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">
@@ -1229,10 +1218,10 @@ background:#E8F5E9;text-align:center;">
     距現價 <b>{sup_pct:+.2f}%</b>（跌破即轉弱）
   </div>
 </div>""", unsafe_allow_html=True)
-            with col_poc:
-                if poc_price is not None:
-                    poc_pct = (poc_price - close_now) / close_now * 100
-                    st.markdown(f"""
+        with col_poc:
+            if poc_price is not None:
+                poc_pct = (poc_price - close_now) / close_now * 100
+                st.markdown(f"""
 <div style="border:1.5px solid #FF9800;border-radius:10px;padding:14px 16px;
 background:#FFF8E1;text-align:center;">
   <div style="font-size:12px;color:#888;font-weight:600;margin-bottom:6px;">
@@ -1246,33 +1235,33 @@ background:#FFF8E1;text-align:center;">
   </div>
 </div>""", unsafe_allow_html=True)
 
-        st.markdown("---")
-        render_ohlcv_chart(
-            df, symbol,
-            show_ma=ma_periods if ma_periods else [5, 10, 20],
-            show_kd=show_kd,
-            show_bb=show_bb,
-            show_rsi=show_rsi,
-            show_macd=show_macd,
-            res_price=_chart_res,
-            sup_price=_chart_sup,
-            poc_price=_chart_poc,
-            res_label=res_label,
-            sup_label=sup_label,
-            poc_label=_poc_label,
-        )
-        render_data_table(df, symbol)
+    st.markdown("---")
+    render_ohlcv_chart(
+        df, symbol,
+        show_ma=ma_periods if ma_periods else [5, 10, 20],
+        show_kd=show_kd,
+        show_bb=show_bb,
+        show_rsi=show_rsi,
+        show_macd=show_macd,
+        res_price=_chart_res,
+        sup_price=_chart_sup,
+        poc_price=_chart_poc,
+        res_label=res_label,
+        sup_label=sup_label,
+        poc_label=_poc_label,
+    )
+    render_data_table(df, symbol)
 
-        # ── 均線扣抵值模組（使用完整資料集確保季線有效）──
-        df_full, deduction_data = calculate_deduction_values(df_full)
-        if deduction_data:
-            render_deduction_section(deduction_data, symbol)
-        else:
-            st.info("顯示天數不足以計算任何均線扣抵值。")
+    # ── 均線扣抵值模組（使用完整資料集確保季線有效）──
+    df_full, deduction_data = calculate_deduction_values(df_full)
+    if deduction_data:
+        render_deduction_section(deduction_data, symbol)
+    else:
+        st.info("顯示天數不足以計算任何均線扣抵值。")
 
-        # ── 進場訊號分析 ─────────────────────────────
-        entry_result = analyze_entry_signal(df_full)
-        if entry_result:
-            render_entry_signal(entry_result, symbol)
-        else:
-            st.info("資料筆數不足（需 30 筆以上）以進行進場訊號分析。")
+    # ── 進場訊號分析 ─────────────────────────────
+    entry_result = analyze_entry_signal(df_full)
+    if entry_result:
+        render_entry_signal(entry_result, symbol)
+    else:
+        st.info("資料筆數不足（需 30 筆以上）以進行進場訊號分析。")

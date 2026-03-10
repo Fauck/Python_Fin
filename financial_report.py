@@ -575,7 +575,7 @@ def build_combo_chart(
         barmode="group",
         height=460,
         legend=dict(orientation="h", y=1.10, x=0, xanchor="left"),
-        margin=dict(l=70, r=70, t=80, b=50),
+        margin=dict(l=10, r=10, t=80, b=10),
         paper_bgcolor="white",
         plot_bgcolor="white",
         hovermode="x unified",
@@ -685,27 +685,26 @@ def analyze_financials(
 
 def render_financial_page() -> None:
     """企業財務報告頁面（Tab 6）。"""
-    ctrl_col, result_col = st.columns([1, 3], gap="large")
-
-    with ctrl_col:
-        st.markdown("#### 查詢條件")
-        raw_symbol = st.text_input(
-            "股票代號",
-            value="2330",
-            max_chars=20,
-            key="fin_symbol",
-            help=(
-                "台股輸入 4-6 位數字代號（如 2330），系統自動嘗試 .TW / .TWO。\n"
-                "美股直接輸入英文代號（如 TSLA、AAPL）。"
-            ),
-        ).strip()
-
-        period = st.radio(
-            "財報期間",
-            options=["年報", "季報"],
-            horizontal=True,
-            key="fin_period",
-        )
+    with st.expander("🔍 查詢條件設定與操作", expanded=True):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            raw_symbol = st.text_input(
+                "股票代號",
+                value="2330",
+                max_chars=20,
+                key="fin_symbol",
+                help=(
+                    "台股輸入 4-6 位數字代號（如 2330），系統自動嘗試 .TW / .TWO。\n"
+                    "美股直接輸入英文代號（如 TSLA、AAPL）。"
+                ),
+            ).strip()
+        with col_b:
+            period = st.radio(
+                "財報期間",
+                options=["年報", "季報"],
+                horizontal=True,
+                key="fin_period",
+            )
         quarterly = period == "季報"
 
         # ── 進階財務診斷參數設定（折疊，預設值可直接使用）
@@ -758,138 +757,134 @@ def render_financial_page() -> None:
             key="fin_query",
         )
 
-    with result_col:
-        if not query_btn:
-            st.info(
-                "請在左側輸入股票代號，點擊「查詢財報」。\n\n"
-                "**支援範圍**\n"
-                "- 台灣上市（.TW）/ 上櫃（.TWO）股票\n"
-                "- 美股及其他 Yahoo Finance 收錄標的\n\n"
-                "**資料說明**\n"
-                "- 資料來源：Yahoo Finance（透過 yfinance）\n"
-                "- 台股財報可能延遲 1-2 個季度\n"
-                "- 「—」表示 Yahoo Finance 未收錄該科目\n"
-                "- 台股單位：億元（新台幣）；美股單位：B / M（USD）"
+    if not query_btn:
+        st.info(
+            "請在上方輸入股票代號，點擊「查詢財報」。\n\n"
+            "**支援範圍**\n"
+            "- 台灣上市（.TW）/ 上櫃（.TWO）股票\n"
+            "- 美股及其他 Yahoo Finance 收錄標的\n\n"
+            "**資料說明**\n"
+            "- 資料來源：Yahoo Finance（透過 yfinance）\n"
+            "- 台股財報可能延遲 1-2 個季度\n"
+            "- 「—」表示 Yahoo Finance 未收錄該科目\n"
+            "- 台股單位：億元（新台幣）；美股單位：B / M（USD）"
+        )
+        return
+
+    if not raw_symbol:
+        st.error("股票代號不得為空。")
+        return
+
+    with st.spinner(f"正在查詢 {raw_symbol} 財報…"):
+        try:
+            data, resolved = get_financial_reports(raw_symbol, quarterly=quarterly)
+        except Exception as e:
+            st.error(
+                f"查詢失敗：{e}\n\n"
+                "可能原因：網路問題、Yahoo Finance 暫時封鎖（HTTP 429），請稍後再試。"
             )
             return
 
-        if not raw_symbol:
-            st.error("股票代號不得為空。")
-            return
+    is_tw     = _TW_CODE_RE.match(raw_symbol.strip().upper()) is not None
+    unit_note = "億元（新台幣）" if is_tw else "B / M（原始報告貨幣）"
 
-        with st.spinner(f"正在查詢 {raw_symbol} 財報…"):
-            try:
-                data, resolved = get_financial_reports(raw_symbol, quarterly=quarterly)
-            except Exception as e:
-                st.error(
-                    f"查詢失敗：{e}\n\n"
-                    "可能原因：網路問題、Yahoo Finance 暫時封鎖（HTTP 429），請稍後再試。"
-                )
-                return
+    st.markdown(f"##### {resolved}　財務報告（{period}）")
 
-        is_tw     = _TW_CODE_RE.match(raw_symbol.strip().upper()) is not None
-        unit_note = "億元（新台幣）" if is_tw else "B / M（原始報告貨幣）"
+    if all(v is None for v in data.values()):
+        st.warning(
+            f"查無 **{resolved}** 的財報資料。\n\n"
+            "可能原因：\n"
+            "- 台股代號錯誤（上市用 .TW，上櫃用 .TWO）\n"
+            "- Yahoo Finance 尚未收錄此標的\n"
+            "- 目前為非交易時段，資料尚未更新\n"
+            "- 請稍後重試或確認代號是否正確"
+        )
+        return
 
-        st.markdown(f"##### {resolved}　財務報告（{period}）")
+    # ── 三大財報原始科目表（科目行索引已透過 _STMT_INDEX_ZH 中文化）
+    report_tabs = st.tabs(["📊 損益表", "🏛 資產負債表", "💰 現金流量表"])
+    tab_map = [
+        ("income_stmt",   "損益表"),
+        ("balance_sheet", "資產負債表"),
+        ("cash_flow",     "現金流量表"),
+    ]
 
-        if all(v is None for v in data.values()):
-            st.warning(
-                f"查無 **{resolved}** 的財報資料。\n\n"
-                "可能原因：\n"
-                "- 台股代號錯誤（上市用 .TW，上櫃用 .TWO）\n"
-                "- Yahoo Finance 尚未收錄此標的\n"
-                "- 目前為非交易時段，資料尚未更新\n"
-                "- 請稍後重試或確認代號是否正確"
-            )
-            return
+    for tab, (key, label) in zip(report_tabs, tab_map):
+        with tab:
+            raw_df = data[key]
+            if raw_df is None:
+                st.info(f"**{label}** 資料目前無法取得（Yahoo Finance 未收錄或查詢逾時）。")
+                continue
 
-        # ── 三大財報原始科目表（科目行索引已透過 _STMT_INDEX_ZH 中文化）
-        report_tabs = st.tabs(["📊 損益表", "🏛 資產負債表", "💰 現金流量表"])
-        tab_map = [
-            ("income_stmt",   "損益表"),
-            ("balance_sheet", "資產負債表"),
-            ("cash_flow",     "現金流量表"),
-        ]
+            disp_df = _prepare_display_df(raw_df, is_tw=is_tw)
+            if disp_df.empty:
+                st.info(f"**{label}** 回傳空資料。")
+                continue
 
-        for tab, (key, label) in zip(report_tabs, tab_map):
-            with tab:
-                raw_df = data[key]
-                if raw_df is None:
-                    st.info(f"**{label}** 資料目前無法取得（Yahoo Finance 未收錄或查詢逾時）。")
-                    continue
-
-                disp_df = _prepare_display_df(raw_df, is_tw=is_tw)
-                if disp_df.empty:
-                    st.info(f"**{label}** 回傳空資料。")
-                    continue
-
-                st.caption(
-                    f"數值單位：{unit_note}　｜　"
-                    f"共 {len(disp_df)} 個科目 × {len(disp_df.columns)} 期"
-                )
-                st.dataframe(disp_df, use_container_width=True)
-
-        # ── 財務關鍵指標分析與投資診斷 ──────────────────
-        st.markdown("---")
-        st.markdown("##### 📈 財務關鍵指標分析與投資診斷")
-
-        with st.spinner("正在計算財務指標…"):
-            try:
-                analysis = analyze_financials(
-                    raw_symbol,
-                    quarterly=quarterly,
-                    target_revenue_growth=target_revenue_growth,
-                    target_gross_margin=target_gross_margin,
-                    target_net_margin=target_net_margin,
-                )
-            except Exception:
-                analysis = None
-
-        if analysis is None:
-            st.info(
-                "損益表資料不足（需至少兩期「總營收」資料），無法執行財務指標分析。"
-            )
-        else:
-            # 雙軸組合圖（柱 + 折線）
-            st.plotly_chart(analysis["chart"], use_container_width=True)
-
-            # 投資診斷訊號
-            advice = analysis["advice"]
-            thr    = analysis["thresholds"]
             st.caption(
-                f"診斷標準 ── 營收成長目標：{thr['revenue_growth']:.1f}%　｜　"
-                f"毛利率低標：{thr['gross_margin']:.1f}%　｜　"
-                f"淨利率低標：{thr['net_margin']:.1f}%"
+                f"數值單位：{unit_note}　｜　"
+                f"共 {len(disp_df)} 個科目 × {len(disp_df.columns)} 期"
             )
+            st.dataframe(disp_df, use_container_width=True)
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**獲利能力達標判定**")
-                st.markdown(advice["margin_signal"])
-            with col_b:
-                st.markdown("**營收動能判定**")
-                st.markdown(advice["growth_signal"])
+    # ── 財務關鍵指標分析與投資診斷 ──────────────────
+    st.markdown("---")
+    st.markdown("##### 📈 財務關鍵指標分析與投資診斷")
 
-            st.markdown(f"**綜合評級：** {advice['overall']}")
-            if advice["detail"]:
-                st.caption(advice["detail"])
+    with st.spinner("正在計算財務指標…"):
+        try:
+            analysis = analyze_financials(
+                raw_symbol,
+                quarterly=quarterly,
+                target_revenue_growth=target_revenue_growth,
+                target_gross_margin=target_gross_margin,
+                target_net_margin=target_net_margin,
+            )
+        except Exception:
+            analysis = None
 
-            # 關鍵指標明細表（摺疊）
-            # 使用 _METRICS_COL_ZH 的 rename(columns=...) 完成欄位中文化
-            with st.expander("查看關鍵指標明細數字", expanded=False):
-                disp = analysis["df"].copy()
-                div  = 1e8 if analysis["is_tw"] else 1e9
-                unit = "億" if analysis["is_tw"] else "B"
+    if analysis is None:
+        st.info(
+            "損益表資料不足（需至少兩期「總營收」資料），無法執行財務指標分析。"
+        )
+    else:
+        # 雙軸組合圖（柱 + 折線）
+        st.plotly_chart(analysis["chart"], use_container_width=True)
 
-                for c in ["revenue", "gross_profit", "operating_income", "net_income"]:
-                    if c in disp.columns:
-                        disp[c] = (disp[c] / div).round(2).astype(str) + f" {unit}"
-                for c in ["gross_margin", "operating_margin", "net_margin", "revenue_growth"]:
-                    if c in disp.columns:
-                        disp[c] = disp[c].apply(
-                            lambda v: f"{float(v):.2f}%" if not pd.isna(v) else "—"
-                        )
+        # 投資診斷訊號
+        advice = analysis["advice"]
+        thr    = analysis["thresholds"]
+        st.caption(
+            f"診斷標準 ── 營收成長目標：{thr['revenue_growth']:.1f}%　｜　"
+            f"毛利率低標：{thr['gross_margin']:.1f}%　｜　"
+            f"淨利率低標：{thr['net_margin']:.1f}%"
+        )
 
-                # 套用中英對照表重命名欄位
-                disp = disp.rename(columns=_METRICS_COL_ZH)
-                st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.markdown("**獲利能力達標判定**")
+        st.markdown(advice["margin_signal"])
+        st.markdown("**營收動能判定**")
+        st.markdown(advice["growth_signal"])
+
+        st.markdown(f"**綜合評級：** {advice['overall']}")
+        if advice["detail"]:
+            st.caption(advice["detail"])
+
+        # 關鍵指標明細表（摺疊）
+        # 使用 _METRICS_COL_ZH 的 rename(columns=...) 完成欄位中文化
+        with st.expander("查看關鍵指標明細數字", expanded=False):
+            disp = analysis["df"].copy()
+            div  = 1e8 if analysis["is_tw"] else 1e9
+            unit = "億" if analysis["is_tw"] else "B"
+
+            for c in ["revenue", "gross_profit", "operating_income", "net_income"]:
+                if c in disp.columns:
+                    disp[c] = (disp[c] / div).round(2).astype(str) + f" {unit}"
+            for c in ["gross_margin", "operating_margin", "net_margin", "revenue_growth"]:
+                if c in disp.columns:
+                    disp[c] = disp[c].apply(
+                        lambda v: f"{float(v):.2f}%" if not pd.isna(v) else "—"
+                    )
+
+            # 套用中英對照表重命名欄位
+            disp = disp.rename(columns=_METRICS_COL_ZH)
+            st.dataframe(disp, use_container_width=True, hide_index=True)

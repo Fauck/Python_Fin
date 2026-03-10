@@ -290,8 +290,8 @@ def _render_insti_chart(
         height=560,
         barmode="group",
         showlegend=True,
-        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
-        margin=dict(l=50, r=20, t=40, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=10, r=10, t=30, b=10),
         xaxis_rangeslider_visible=False,
         paper_bgcolor="white",
         plot_bgcolor="white",
@@ -308,141 +308,139 @@ def _render_insti_chart(
 
 def render_chips_page() -> None:
     """籌碼與基本面分析頁面（Tab 4）。"""
-    ctrl_col, result_col = st.columns([1, 3], gap="large")
-
-    with ctrl_col:
-        st.markdown("#### 查詢條件")
-        symbol = st.text_input(
-            "股票代號", value="2330", max_chars=10,
-            key="chips_page_symbol",
-            help="輸入台灣股票代號，例如 2330（台積電）",
-        ).strip()
-
-        days: int = st.selectbox(  # type: ignore[assignment]
-            "回查天數",
-            options=[30, 60, 90],
-            index=1,
-            key="chips_page_days",
-            help="查詢三大法人資料的回查日曆天數",
-        )
+    with st.expander("🔍 查詢條件設定與操作", expanded=True):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            symbol = st.text_input(
+                "股票代號", value="2330", max_chars=10,
+                key="chips_page_symbol",
+                help="輸入台灣股票代號，例如 2330（台積電）",
+            ).strip()
+        with col_b:
+            days: int = st.selectbox(  # type: ignore[assignment]
+                "回查天數",
+                options=[30, 60, 90],
+                index=1,
+                key="chips_page_days",
+                help="查詢三大法人資料的回查日曆天數",
+            )
 
         query_btn = st.button(
             "查詢籌碼", type="primary", use_container_width=True,
             key="chips_page_query",
         )
 
-    with result_col:
-        if not query_btn:
-            st.info(
-                "請在左側輸入股票代號並選擇回查天數，點擊「查詢籌碼」。\n\n"
-                "**功能說明**\n"
-                "- 📊 K 線 ＋ 三大法人買賣超（外資 / 投信 / 自營商）疊加圖\n"
-                "- 🔔 籌碼亮點自動偵測（投信連買、外資轉向）\n"
-                "- 💰 近三年平均現金殖利率快覽"
-            )
-            return
+    if not query_btn:
+        st.info(
+            "請在上方輸入股票代號並選擇回查天數，點擊「查詢籌碼」。\n\n"
+            "**功能說明**\n"
+            "- 📊 K 線 ＋ 三大法人買賣超（外資 / 投信 / 自營商）疊加圖\n"
+            "- 🔔 籌碼亮點自動偵測（投信連買、外資轉向）\n"
+            "- 💰 近三年平均現金殖利率快覽"
+        )
+        return
 
-        if not symbol:
-            st.error("股票代號不得為空，請重新輸入。")
-            return
+    if not symbol:
+        st.error("股票代號不得為空，請重新輸入。")
+        return
 
-        with st.spinner(f"正在取得 {symbol} 資料…"):
-            df_candle = fetch_stock_candles(
-                symbol=symbol,
-                limit=days,
-                fields="open,high,low,close,volume",
-            )
-            # 以 K 線第一筆日期對齊籌碼資料起始點，消除時間軸錯位
-            candle_start: Optional[str] = None
-            if not df_candle.empty and "date" in df_candle.columns:
-                candle_start = pd.Timestamp(str(df_candle.iloc[0]["date"])).strftime("%Y-%m-%d")
-            df_insti = fetch_institutional_trading(
-                symbol=symbol, days=days, start_date=candle_start
-            )
-            div_data = fetch_dividends(symbol=symbol)
+    with st.spinner(f"正在取得 {symbol} 資料…"):
+        df_candle = fetch_stock_candles(
+            symbol=symbol,
+            limit=days,
+            fields="open,high,low,close,volume",
+        )
+        # 以 K 線第一筆日期對齊籌碼資料起始點，消除時間軸錯位
+        candle_start: Optional[str] = None
+        if not df_candle.empty and "date" in df_candle.columns:
+            candle_start = pd.Timestamp(str(df_candle.iloc[0]["date"])).strftime("%Y-%m-%d")
+        df_insti = fetch_institutional_trading(
+            symbol=symbol, days=days, start_date=candle_start
+        )
+        div_data = fetch_dividends(symbol=symbol)
 
-        if df_candle.empty:
-            st.warning(f"查無 **{symbol}** 的 K 線資料，請確認代號是否正確。")
-            return
+    if df_candle.empty:
+        st.warning(f"查無 **{symbol}** 的 K 線資料，請確認代號是否正確。")
+        return
 
-        # ── 籌碼亮點 Banner ─────────────────────────
-        highlights = analyze_highlights(df_insti)
-        if highlights:
-            st.success("\n\n".join(highlights))
-        elif not df_insti.empty:
-            st.info("目前無特殊籌碼訊號。")
+    # ── 籌碼亮點 Banner ─────────────────────────
+    highlights = analyze_highlights(df_insti)
+    if highlights:
+        st.success("\n\n".join(highlights))
+    elif not df_insti.empty:
+        st.info("目前無特殊籌碼訊號。")
 
-        # ── K 線 + 法人圖 ────────────────────────────
-        st.markdown(f"##### {symbol} K 線 ＋ 三大法人買賣超（近 {days} 天）")
-        if not df_insti.empty:
-            _render_insti_chart(df_candle, df_insti, symbol)
-        else:
-            st.warning(
-                "三大法人資料目前無法取得（API 端點可能不支援或此標的查無資料）。"
-                "以下僅顯示 K 線。"
-            )
-            fig = go.Figure(go.Candlestick(
-                x=df_candle["date"],
-                open=df_candle["open"],
-                high=df_candle["high"],
-                low=df_candle["low"],
-                close=df_candle["close"],
-                name=symbol,
-                increasing_line_color="#EF5350",
-                decreasing_line_color="#26A69A",
-            ))
-            fig.update_layout(
-                height=320,
-                xaxis_rangeslider_visible=False,
-                margin=dict(l=50, r=20, t=30, b=20),
-                paper_bgcolor="white",
-                plot_bgcolor="white",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    # ── K 線 + 法人圖 ────────────────────────────
+    st.markdown(f"##### {symbol} K 線 ＋ 三大法人買賣超（近 {days} 天）")
+    if not df_insti.empty:
+        _render_insti_chart(df_candle, df_insti, symbol)
+    else:
+        st.warning(
+            "三大法人資料目前無法取得（API 端點可能不支援或此標的查無資料）。"
+            "以下僅顯示 K 線。"
+        )
+        fig = go.Figure(go.Candlestick(
+            x=df_candle["date"],
+            open=df_candle["open"],
+            high=df_candle["high"],
+            low=df_candle["low"],
+            close=df_candle["close"],
+            name=symbol,
+            increasing_line_color="#EF5350",
+            decreasing_line_color="#26A69A",
+        ))
+        fig.update_layout(
+            height=320,
+            xaxis_rangeslider_visible=False,
+            margin=dict(l=10, r=10, t=30, b=10),
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        # ── 法人明細表 ──────────────────────────────
-        if not df_insti.empty:
-            st.markdown("---")
-            st.markdown("##### 三大法人買賣超明細（千張）")
-            disp = df_insti.copy()
-            disp["date"] = pd.to_datetime(disp["date"]).dt.strftime("%Y-%m-%d")
-            disp = disp.sort_values("date", ascending=False).reset_index(drop=True)
-            disp.columns = ["日期", "外資", "投信", "自營商"]
-            fmt: Dict[str, Any] = {"外資": "{:.2f}", "投信": "{:.2f}", "自營商": "{:.2f}"}
-            st.dataframe(
-                disp.style.format(fmt),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        # ── 股利快覽 ─────────────────────────────────
+    # ── 法人明細表 ──────────────────────────────
+    if not df_insti.empty:
         st.markdown("---")
-        st.markdown("##### 基本面：現金殖利率快覽")
-        if div_data is not None and not df_candle.empty:
-            avg_cash      = div_data["avg_cash_3yr"]
-            current_close = float(df_candle["close"].iloc[-1])
-            yield_pct     = avg_cash / current_close * 100 if current_close > 0 else 0.0
+        st.markdown("##### 三大法人買賣超明細（千張）")
+        disp = df_insti.copy()
+        disp["date"] = pd.to_datetime(disp["date"]).dt.strftime("%Y-%m-%d")
+        disp = disp.sort_values("date", ascending=False).reset_index(drop=True)
+        disp.columns = ["日期", "外資", "投信", "自營商"]
+        fmt: Dict[str, Any] = {"外資": "{:.2f}", "投信": "{:.2f}", "自營商": "{:.2f}"}
+        st.dataframe(
+            disp.style.format(fmt),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("近 3 年平均現金股利", f"{avg_cash:.2f} 元")
-            c2.metric("現價", f"{current_close:.2f} 元")
-            c3.metric(
-                "估算現金殖利率",
-                f"{yield_pct:.2f}%",
-                delta="達標 ✅" if yield_pct >= 5.0 else None,
+    # ── 股利快覽 ─────────────────────────────────
+    st.markdown("---")
+    st.markdown("##### 基本面：現金殖利率快覽")
+    if div_data is not None and not df_candle.empty:
+        avg_cash      = div_data["avg_cash_3yr"]
+        current_close = float(df_candle["close"].iloc[-1])
+        yield_pct     = avg_cash / current_close * 100 if current_close > 0 else 0.0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("近 3 年平均現金股利", f"{avg_cash:.2f} 元")
+        c2.metric("現價", f"{current_close:.2f} 元")
+        c3.metric(
+            "估算現金殖利率",
+            f"{yield_pct:.2f}%",
+            delta="達標 ✅" if yield_pct >= 5.0 else None,
+        )
+
+        if yield_pct >= 5.0:
+            st.success(
+                f"**{symbol}** 估算現金殖利率 **{yield_pct:.2f}%**，"
+                "已達長線配息門檻（5%），可列入長線佈局觀察。"
             )
-
-            if yield_pct >= 5.0:
-                st.success(
-                    f"**{symbol}** 估算現金殖利率 **{yield_pct:.2f}%**，"
-                    "已達長線配息門檻（5%），可列入長線佈局觀察。"
-                )
-            else:
-                st.info(
-                    f"**{symbol}** 估算現金殖利率 **{yield_pct:.2f}%**"
-                    "（長線門檻：5%）。"
-                )
         else:
             st.info(
-                "股利資料目前無法取得（API 端點可能不支援或此標的查無資料）。"
+                f"**{symbol}** 估算現金殖利率 **{yield_pct:.2f}%**"
+                "（長線門檻：5%）。"
             )
+    else:
+        st.info(
+            "股利資料目前無法取得（API 端點可能不支援或此標的查無資料）。"
+        )
