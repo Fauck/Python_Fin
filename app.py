@@ -33,15 +33,15 @@ def main() -> None:
         page_icon="📊",
         layout="wide",
     )
-    st.title("📊 台股分析儀表板")
-    st.caption("資料來源：Fugle Market Data API")
-
-    # ── 側邊欄開關：隱藏耗時的策略分析頁籤 ─────────────────────────
-    with st.sidebar:
+    col_title, col_toggle = st.columns([6, 1])
+    col_title.title("📊 台股分析儀表板")
+    col_title.caption("資料來源：Fugle Market Data API")
+    with col_toggle:
+        st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
         hide_strategy = st.toggle(
-            "隱藏策略分析頁籤",
+            "精簡模式",
             value=True,
-            help="開啟時暫時隱藏「🔍 選股策略」與「🔁 策略回測」，加快頁面載入速度。",
+            help="開啟時隱藏「🔍 選股策略」與「🔁 策略回測」，加快載入速度。",
         )
 
     # ── 依開關狀態動態組建 Tab 列表 ──────────────────────────────────
