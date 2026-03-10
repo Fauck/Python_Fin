@@ -18,3 +18,4 @@ fugle-marketdata
 requests
 beautifulsoup4
 lxml
+python-dotenv
