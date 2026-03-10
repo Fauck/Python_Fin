@@ -15,6 +15,7 @@ from utils import (
     fetch_stock_candles,
     compute_ma, compute_kd,
     compute_bollinger, compute_rsi, compute_macd,
+    detect_all_candlestick_patterns,
 )
 
 
@@ -44,7 +45,6 @@ def _deduction_trend(bias: float) -> Tuple[str, str]:
 
 def calculate_deduction_values(
     df: pd.DataFrame,
-    display_limit: int,
 ) -> Tuple[pd.DataFrame, Optional[List[Dict[str, Any]]]]:
     """
     計算 5MA / 10MA / 20MA / 60MA 的扣抵值與趨勢預判。
@@ -89,10 +89,10 @@ def calculate_deduction_values(
 
     df = df.copy().reset_index(drop=True)
 
-    # 篩選：只保留「顯示天數 ≥ 均線週期」且「資料筆數足夠計算」的均線
+    # 篩選：只要資料筆數足夠計算即納入，不受前端顯示天數限制
     MA_CONFIGS: List[Tuple[int, str, str]] = [
         cfg for cfg in ALL_CONFIGS
-        if cfg[0] <= display_limit and len(df) >= cfg[0]
+        if len(df) >= cfg[0]
     ]
 
     if df.empty or not MA_CONFIGS:
@@ -276,17 +276,27 @@ def analyze_entry_signal(df_full: pd.DataFrame) -> Optional[Dict[str, Any]]:
             pts, ok, msg = 0,  False, f"RSI {rsi:.1f} — 超買過熱 (>80)，謹慎"
         add("⚡ 動能", "RSI(14) 動能狀態", ok, pts, 15, msg)
 
-    macd_hist   = _sf(r.get("macd_hist"))
-    macd_line   = _sf(r.get("macd_line"))
-    macd_signal = _sf(r.get("macd_signal"))
+    macd_hist      = _sf(r.get("macd_hist"))
+    macd_line      = _sf(r.get("macd_line"))
+    macd_signal    = _sf(r.get("macd_signal"))
+    prev_macd_hist = _sf(df.iloc[-2].get("macd_hist")) if len(df) >= 2 else None
     if macd_hist is not None:
-        ok = macd_hist > 0
+        # 動能擴張：今日柱 > 昨日柱（多頭擴張 或 空頭收斂，均視為有利）
+        expanding = prev_macd_hist is not None and macd_hist > prev_macd_hist
+        ok        = expanding if prev_macd_hist is not None else macd_hist > 0
         cross = ""
         if macd_line is not None and macd_signal is not None:
             cross = f"，DIF {macd_line:+.3f} / DEA {macd_signal:+.3f}"
-        add("⚡ 動能", "MACD 柱狀圖方向",
-            ok, 10 if ok else 0, 10,
-            f"直方圖 {macd_hist:+.3f}（{'多頭擴張 ↑' if ok else '空頭收縮 ↓'}）{cross}")
+        if prev_macd_hist is not None:
+            delta     = macd_hist - prev_macd_hist
+            direction = ("多頭擴張 ↑" if macd_hist > 0 and expanding else
+                         "空頭收斂 ↑" if macd_hist <= 0 and expanding else
+                         "多頭收斂 ↓" if macd_hist > 0 else
+                         "空頭擴張 ↓")
+            detail = (f"直方圖 {macd_hist:+.3f}（{direction}，Δ{delta:+.3f}）{cross}")
+        else:
+            detail = (f"直方圖 {macd_hist:+.3f}（{'正值' if macd_hist > 0 else '負值'}，無前日資料）{cross}")
+        add("⚡ 動能", "MACD 柱狀圖動能", ok, 10 if ok else 0, 10, detail)
 
     k_val = _sf(r.get("k_val"))
     d_val = _sf(r.get("d_val"))
@@ -311,53 +321,67 @@ def analyze_entry_signal(df_full: pd.DataFrame) -> Optional[Dict[str, Any]]:
         add("📊 波動", "布林通道位置", ok, pts, 10, msg)
 
     # ── 波動②：BB 壓縮突破訊號 (10 pts) ─────────
-    # 壓縮定義：近 5 日平均帶寬 < 0.10（籌碼極度壓縮）
+    # 壓縮定義：近 5 日均帶寬 < 過去 60 根帶寬的第 20 分位數（動態相對標準）
     # 高勝率：壓縮 + 突破上軌 + 爆量（三者同時）
-    _BW_THRESHOLD = 0.10
     if "bb_width" in df.columns and bb_mid is not None and bb_upper is not None:
         bw_series = df["bb_width"].dropna()
         if len(bw_series) >= 5:
-            avg_bw_5d  = float(bw_series.iloc[-5:].mean())
-            is_squeeze  = avg_bw_5d < _BW_THRESHOLD
+            # 動態閾值：取過去至少 60 根（不足則全用）的 20% 分位
+            bw_lookback = bw_series.iloc[-60:] if len(bw_series) >= 60 else bw_series
+            bw_p20      = float(bw_lookback.quantile(0.2))
+
+            avg_bw_5d   = float(bw_series.iloc[-5:].mean())
+            is_squeeze  = avg_bw_5d < bw_p20
             is_breakout = close >= bb_upper
 
             vol_v    = _sf(r.get("volume"))
             avg5_vol = (float(df["volume"].iloc[-6:-1].mean())
                         if "volume" in df.columns and len(df) >= 6 else None)
             vol_surge = (vol_v is not None and avg5_vol is not None
-                         and avg5_vol > 0 and vol_v > avg5_vol * 1.5)
+                         and avg5_vol > 0 and vol_v > avg5_vol * 1.5
+                         and vol_v >= 500)
 
             if is_squeeze and is_breakout and vol_surge:
                 pts, ok = 10, True
                 msg = (f"壓縮突破上軌且爆量"
-                       f"（5日均帶寬 {avg_bw_5d:.3f} < {_BW_THRESHOLD}）— 最高勝率訊號 ⭐")
+                       f"（5日均帶寬 {avg_bw_5d:.3f} < P20 {bw_p20:.3f}）— 最高勝率訊號 ⭐")
             elif is_squeeze and is_breakout:
                 pts, ok = 7, True
-                msg = (f"壓縮後突破上軌（5日均帶寬 {avg_bw_5d:.3f}），"
+                msg = (f"壓縮後突破上軌（5日均帶寬 {avg_bw_5d:.3f} < P20 {bw_p20:.3f}），"
                        "放量確認後信號更強")
             elif is_squeeze:
                 pts, ok = 5, True
-                msg = (f"通道壓縮中（5日均帶寬 {avg_bw_5d:.3f} < {_BW_THRESHOLD}），"
+                msg = (f"通道壓縮中（5日均帶寬 {avg_bw_5d:.3f} < P20 {bw_p20:.3f}），"
                        "等待突破上軌方向")
             else:
                 pts, ok = 0, False
                 msg = (f"通道未達壓縮（5日均帶寬 {avg_bw_5d:.3f}"
-                       f" ≥ {_BW_THRESHOLD}），無擠壓爆發條件")
+                       f" ≥ P20 {bw_p20:.3f}），無擠壓爆發條件")
 
             add("📊 波動", "BB壓縮突破訊號", ok, pts, 10, msg)
 
     # ── 量能 ─────────────────────────────────
+    _VOL_MIN = 500   # 流動性絕對門檻：今日成交量須達 500 張
     vol_today = _sf(r.get("volume"))
     if vol_today is not None and len(df) >= 6:
         avg5 = float(df["volume"].iloc[-6:-1].mean())
         if avg5 > 0:
-            ratio = vol_today / avg5
-            if ratio >= 1.5:
-                pts, ok, msg = 10, True, f"量比 {ratio:.2f}x — 爆量，買盤強勁"
+            ratio         = vol_today / avg5
+            has_liquidity = vol_today >= _VOL_MIN
+            if ratio >= 1.5 and has_liquidity:
+                pts, ok, msg = 10, True,  (f"量比 {ratio:.2f}x，今日 {int(vol_today)} 張"
+                                            " — 爆量，買盤強勁")
+            elif ratio >= 1.5:
+                pts, ok, msg =  3, False, (f"量比 {ratio:.2f}x 但今日僅 {int(vol_today)} 張"
+                                            f"（< {_VOL_MIN} 張門檻）— 流動性不足，訊號無效")
+            elif ratio >= 1.0 and has_liquidity:
+                pts, ok, msg =  5, True,  (f"量比 {ratio:.2f}x，今日 {int(vol_today)} 張"
+                                            " — 溫和放量")
             elif ratio >= 1.0:
-                pts, ok, msg = 5, True,  f"量比 {ratio:.2f}x — 溫和放量"
+                pts, ok, msg =  3, False, (f"量比 {ratio:.2f}x 但今日僅 {int(vol_today)} 張"
+                                            f"（< {_VOL_MIN} 張門檻）— 流動性不足")
             else:
-                pts, ok, msg = 0, False, f"量比 {ratio:.2f}x — 縮量，注意觀望"
+                pts, ok, msg =  0, False,  f"量比 {ratio:.2f}x — 縮量，注意觀望"
             add("📦 量能", "今日量 vs 5日均量", ok, pts, 10, msg)
 
     # ── 信號評級 ─────────────────────────────
@@ -1008,6 +1032,32 @@ def render_single_stock_page() -> None:
                 info_cols[ic].metric("BB 帶寬", f"{bb_w:.3f}",
                                      "擠壓" if bb_w < df["bb_width"].quantile(0.2) else "正常")
 
+        # ── K 線型態快訊（酒田戰法，pandas-ta cdl_pattern）────────────
+        cdl_patterns = detect_all_candlestick_patterns(df_full)
+        if cdl_patterns:
+            badges = []
+            for p in cdl_patterns:
+                is_bull = p.startswith("🟢")
+                color   = "#2E7D32" if is_bull else "#C62828"
+                bg      = "#E8F5E9" if is_bull else "#FFEBEE"
+                badges.append(
+                    f'<span style="display:inline-block;background:{bg};'
+                    f'border:1.5px solid {color};border-radius:6px;'
+                    f'padding:4px 12px;margin:3px 4px;font-size:14px;'
+                    f'font-weight:600;color:{color};">{p}</span>'
+                )
+            st.markdown(
+                '<div style="margin:6px 0;"><b>🕯️ 今日 K 線型態</b><br>'
+                + "".join(badges) + "</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<p style="font-size:13px;color:#999;margin:6px 0;">'
+                "➖ 今日無特殊 K 線型態</p>",
+                unsafe_allow_html=True,
+            )
+
         st.markdown("---")
         render_ohlcv_chart(
             df, symbol,
@@ -1020,7 +1070,7 @@ def render_single_stock_page() -> None:
         render_data_table(df, symbol)
 
         # ── 均線扣抵值模組（使用完整資料集確保季線有效）──
-        df_full, deduction_data = calculate_deduction_values(df_full, int(limit))
+        df_full, deduction_data = calculate_deduction_values(df_full)
         if deduction_data:
             render_deduction_section(deduction_data, symbol)
         else:

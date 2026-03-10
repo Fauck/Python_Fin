@@ -59,6 +59,8 @@ def run_backtest(
     exit_on_ma20: bool = True,
     use_atr_stop: bool = False,
     atr_multiplier: float = 2.0,
+    tx_cost_pct: float = 0.00585,
+    max_hold_days: int = 20,
 ) -> Dict[str, Any]:
     """
     對給定 DataFrame 執行單一策略的模擬回測。
@@ -66,11 +68,12 @@ def run_backtest(
     規則
     ----
     - 訊號觸發日（i）→ 次日開盤（i+1）買入
-    - 出場條件（從 i+2 起）：
-        1. 收盤 ≥ 買入價 × (1 + take_profit_pct)       → 停利出場
-        2. 固定停損：收盤 ≤ 買入價 × (1 − stop_loss_pct) → 停損出場
-           ATR停損：收盤 ≤ 買入價 − ATR × atr_multiplier  → 停損出場
+    - 出場條件（從 i+2 起，盤中觸價優先）：
+        1. 當日 low <= sl_price                          → 盤中停損，以 sl_price 結算
+        2. 當日 high >= tp_price（未觸停損）              → 盤中停利，以 tp_price 結算
         3. 收盤 < 20MA（若 exit_on_ma20=True）           → 均線出場
+        4. 持倉 >= max_hold_days（均未觸發時）            → 時間停損，以收盤結算
+    - 每筆交易損益均扣除雙邊摩擦成本 tx_cost_pct
     - 每筆交易結束後，從出場日+1繼續掃描（無重疊倉位）
     - 若達資料末尾仍未觸發出場條件，以最後一天收盤強制平倉
 
@@ -83,6 +86,8 @@ def run_backtest(
     exit_on_ma20    : 是否啟用跌破 20MA 出場條件
     use_atr_stop    : True → 改用 ATR 動態停損（入場價 − ATR × atr_multiplier）
     atr_multiplier  : ATR 停損倍數（預設 2.0）
+    tx_cost_pct     : 雙邊交易摩擦成本（手續費+證交稅，預設 0.00585 ≈ 0.585%）
+    max_hold_days   : 時間停損：最長持倉交易日數（預設 20 天）
 
     Returns
     -------
@@ -90,12 +95,13 @@ def run_backtest(
         trades          : list of trade dicts,
         total_trades    : int,
         win_rate        : float（0~100 的百分比）,
-        total_return    : float（累計報酬 %）,
+        total_return    : float（累計報酬 %，已扣費）,
         equity_curve    : list of float（起始 1.0，每筆交易後更新）,
         max_drawdown    : float（最大回撤 %）,
         sharpe          : float（每筆交易夏普比率，年化近似值）,
         profit_factor   : float（獲利因子，贏/虧；無虧損時為 inf）,
         max_consec_loss : int（最大連續虧損筆數）,
+        bh_return       : float（買入持有基準報酬 %）,
     }
     """
     _EMPTY: Dict[str, Any] = {
@@ -104,6 +110,7 @@ def run_backtest(
         "equity_curve": [1.0],
         "max_drawdown": 0.0, "sharpe": 0.0,
         "profit_factor": 0.0, "max_consec_loss": 0,
+        "bh_return": 0.0,
     }
 
     if df.empty or len(df) < 30:
@@ -117,6 +124,11 @@ def run_backtest(
     # ATR 動態停損：預先計算全段 ATR
     if use_atr_stop:
         df = compute_atr(df, period=14)
+
+    # 買入持有基準報酬（第一日開盤 → 最後一日收盤）
+    first_open = float(df.iloc[0]["open"]) if "open" in df.columns else float(df.iloc[0]["close"])
+    last_close = float(df.iloc[-1]["close"])
+    bh_return  = (last_close - first_open) / first_open * 100 if first_open > 0 else 0.0
 
     trades: List[Dict[str, Any]] = []
     i = 0
@@ -156,20 +168,34 @@ def run_backtest(
         exit_reason = "強制平倉"
 
         for j in range(buy_idx + 1, len(df)):
-            close = float(df.iloc[j]["close"])
-            ma20  = df.iloc[j]["_ma20"]
+            row   = df.iloc[j]
+            close = float(row["close"])
+            high  = float(row["high"]) if "high" in df.columns else close
+            low   = float(row["low"])  if "low"  in df.columns else close
+            ma20  = row["_ma20"]
 
-            if close >= tp_price:
-                exit_idx, exit_price, exit_reason = j, close, "停利"
+            # 1. 盤中觸及停損（low 跌破 sl_price，以 sl_price 結算）
+            if low <= sl_price:
+                exit_idx, exit_price, exit_reason = j, sl_price, "停損"
                 break
-            if close <= sl_price:
-                exit_idx, exit_price, exit_reason = j, close, "停損"
+
+            # 2. 盤中觸及停利（high 超過 tp_price，以 tp_price 結算）
+            if high >= tp_price:
+                exit_idx, exit_price, exit_reason = j, tp_price, "停利"
                 break
+
+            # 3. 均線出場（收盤跌破 20MA）
             if exit_on_ma20 and not pd.isna(ma20) and close < float(ma20):
                 exit_idx, exit_price, exit_reason = j, close, "跌破MA20"
                 break
 
-        pnl_pct   = (exit_price - entry_price) / entry_price * 100
+            # 4. 時間停損（前三項均未觸發，且持倉達上限）
+            if j - buy_idx >= max_hold_days:
+                exit_idx, exit_price, exit_reason = j, close, "時間停損"
+                break
+
+        # 扣除雙邊摩擦成本（手續費 + 證交稅）
+        pnl_pct   = (exit_price - entry_price) / entry_price * 100 - tx_cost_pct * 100
         hold_days = exit_idx - buy_idx
         trades.append({
             "買入日期": str(df.iloc[buy_idx]["date"])[:10],
@@ -185,13 +211,13 @@ def run_backtest(
         i = exit_idx + 1
 
     if not trades:
-        return _EMPTY
+        return {**_EMPTY, "bh_return": round(bh_return, 2)}
 
     pnls = [t["損益(%)"] / 100 for t in trades]
     wins = sum(1 for p in pnls if p > 0)
     n    = len(pnls)
 
-    # 資金曲線 + 最大回撤（MDD）
+    # 資金曲線 + 最大回撤（MDD）— 基於扣費後損益
     equity    = 1.0
     peak      = 1.0
     max_dd    = 0.0
@@ -237,6 +263,7 @@ def run_backtest(
         "sharpe":          sharpe,
         "profit_factor":   profit_factor,
         "max_consec_loss": max_consec,
+        "bh_return":       round(bh_return, 2),
     }
 
 
@@ -250,6 +277,8 @@ def _cached_backtest(
     exit_on_ma20: bool,
     use_atr_stop: bool,
     atr_multiplier: float,
+    tx_cost_pct: float,
+    max_hold_days: int,
 ) -> Dict[str, Any]:
     """快取版回測（依參數快取，避免重複 API 呼叫與重算）。"""
     df       = fetch_stock_candles(symbol=symbol, limit=fetch_limit)
@@ -262,13 +291,16 @@ def _cached_backtest(
             "equity_curve": [1.0],
             "max_drawdown": 0.0, "sharpe": 0.0,
             "profit_factor": 0.0, "max_consec_loss": 0,
+            "bh_return": 0.0,
         }
 
     strategy_fn = registry[strategy_name]
     return run_backtest(
-        df, strategy_fn,
-        take_profit_pct, stop_loss_pct,
-        exit_on_ma20, use_atr_stop, atr_multiplier,
+        df=df, strategy_fn=strategy_fn,
+        take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
+        exit_on_ma20=exit_on_ma20, use_atr_stop=use_atr_stop,
+        atr_multiplier=atr_multiplier, tx_cost_pct=tx_cost_pct,
+        max_hold_days=max_hold_days,
     )
 
 
@@ -338,6 +370,21 @@ def render_backtest_page() -> None:
             help="收盤跌破 20 日均線時強制出場",
         )
 
+        max_hold_days = st.number_input(
+            "時間停損（最大持倉天數）", min_value=1, max_value=120, value=20, step=1,
+            key="bt_max_hold",
+            help="持倉超過此交易日數後，無論損益一律以收盤價強制平倉",
+        )
+
+        st.markdown("---")
+        st.markdown("##### 交易成本")
+        tx_cost_pct = st.number_input(
+            "雙邊摩擦成本（%）", min_value=0.0, max_value=5.0,
+            value=0.585, step=0.05, format="%.3f",
+            key="bt_tx_cost",
+            help="手續費 0.1425%×2 + 證交稅 0.3% = 0.585%（預設台股標準）",
+        ) / 100.0
+
         run_btn = st.button(
             "開始回測", type="primary", use_container_width=True,
             key="bt_run",
@@ -370,6 +417,8 @@ def render_backtest_page() -> None:
                     exit_on_ma20=exit_on_ma20,
                     use_atr_stop=use_atr_stop,
                     atr_multiplier=float(atr_multiplier),
+                    tx_cost_pct=float(tx_cost_pct),
+                    max_hold_days=int(max_hold_days),
                 )
             except Exception as e:
                 st.error(f"回測失敗：{e}\n\n請確認股票代號是否正確，或稍後再試。")
@@ -382,6 +431,7 @@ def render_backtest_page() -> None:
         sharpe       = result["sharpe"]
         pf           = result["profit_factor"]
         max_consec   = result["max_consec_loss"]
+        bh_return    = result.get("bh_return", 0.0)
 
         # ── KPI 指標卡（第一行）────────────────────────
         st.markdown(f"##### {symbol} × {strategy_name}（{year_label}）")
@@ -392,10 +442,16 @@ def render_backtest_page() -> None:
             f"{win_rate:.1f}%",
             delta=("高勝率 ✅" if win_rate >= 50 else "偏低 ⚠️") if total_trades > 0 else None,
         )
+        # 累計報酬 vs 買入持有基準對比
+        beat_bh = total_return > bh_return
         m3.metric(
-            "累計報酬",
+            "累計報酬（扣費後）",
             f"{total_return:.2f}%",
-            delta=("正報酬 ✅" if total_return > 0 else "負報酬 ❌") if total_trades > 0 else None,
+            delta=(
+                f"B&H {bh_return:.1f}%  ✅ 打敗基準" if beat_bh
+                else f"B&H {bh_return:.1f}%  ⚠️ 落後基準"
+            ) if total_trades > 0 else None,
+            delta_color="normal" if beat_bh else "inverse",
         )
 
         # ── KPI 指標卡（第二行）────────────────────────

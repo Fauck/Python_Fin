@@ -212,26 +212,35 @@ def _find_row(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
     return None
 
 
-def _extract_key_metrics(df_income: pd.DataFrame) -> Optional[pd.DataFrame]:
+def _extract_key_metrics(
+    df_income: pd.DataFrame,
+    quarterly: bool = False,
+    is_tw: bool = False,
+) -> Optional[pd.DataFrame]:
     """
     從損益表 DataFrame 提取核心財務指標，並計算衍生欄位。
 
     輸入：yfinance 損益表（index=科目, columns=日期，通常為降冪排列）
     輸出：升冪 DataFrame，內部欄位名稱（英文）供計算使用，
           顯示時再透過 _METRICS_COL_ZH 翻譯為繁體中文：
-          period / revenue / gross_profit / net_income /
-          gross_margin / net_margin / revenue_growth
+          period / revenue / gross_profit / operating_income / net_income /
+          gross_margin / operating_margin / net_margin / revenue_growth
 
     NaN 安全處理
     -----------
-    - 若 revenue 為 0 或 NaN，毛利率 / 淨利率設為 NaN（避免 inf）
-    - pct_change 首期為 NaN（正常，無前一期可比）
+    - 若 revenue 為 0 或 NaN，各利潤率設為 NaN（避免 inf）
+    - 季報 revenue_growth 使用 pct_change(periods=4) 計算 YoY 年增率
+    - 年報 revenue_growth 使用 pct_change(periods=1)
+    - 台股量級防呆：最新一期營收 < 1e8 時整欄乘以 1000（千元 → 元）
     """
     revenue_row = _find_row(df_income, [
         "Total Revenue", "TotalRevenue", "Revenue", "Net Revenue",
     ])
     gross_row = _find_row(df_income, [
         "Gross Profit", "GrossProfit",
+    ])
+    op_income_row = _find_row(df_income, [
+        "Operating Income", "OperatingIncome", "Operating Profit", "EBIT",
     ])
     net_row = _find_row(df_income, [
         "Net Income", "NetIncome",
@@ -254,24 +263,40 @@ def _extract_key_metrics(df_income: pd.DataFrame) -> Optional[pd.DataFrame]:
         return [float(pd.to_numeric(v, errors="coerce")) for v in row.values]
 
     df = pd.DataFrame({
-        "period":       periods,
-        "revenue":      _to_float_list(revenue_row),
-        "gross_profit": _to_float_list(gross_row),
-        "net_income":   _to_float_list(net_row),
+        "period":            periods,
+        "revenue":           _to_float_list(revenue_row),
+        "gross_profit":      _to_float_list(gross_row),
+        "operating_income":  _to_float_list(op_income_row),
+        "net_income":        _to_float_list(net_row),
     })
 
     # yfinance 通常降冪（最新在上）→ 反轉為升冪後再計算成長率
     df = df.iloc[::-1].reset_index(drop=True)
+
+    # ── 台股量級防呆：若最新一期營收 < 1e8，推測為千元單位，整欄乘以 1000 ──
+    if is_tw:
+        latest_rev = df["revenue"].dropna()
+        if len(latest_rev) > 0 and abs(float(latest_rev.iloc[-1])) < 1e8:
+            for col in ["revenue", "gross_profit", "operating_income", "net_income"]:
+                df[col] = df[col] * 1000
 
     # 衍生欄位：以 replace(0, nan) 避免除以零產生 inf
     safe_rev = df["revenue"].replace(0, float("nan"))
     df["gross_margin"] = (
         df["gross_profit"] / safe_rev * 100
     ).replace([float("inf"), float("-inf")], float("nan")).round(2)
+    df["operating_margin"] = (
+        df["operating_income"] / safe_rev * 100
+    ).replace([float("inf"), float("-inf")], float("nan")).round(2)
     df["net_margin"] = (
         df["net_income"] / safe_rev * 100
     ).replace([float("inf"), float("-inf")], float("nan")).round(2)
-    df["revenue_growth"] = df["revenue"].pct_change().mul(100).round(2)
+
+    # 季報使用 pct_change(4) 計算 YoY（去年同期比）；年報用 pct_change(1)
+    growth_periods = 4 if quarterly else 1
+    df["revenue_growth"] = (
+        df["revenue"].pct_change(periods=growth_periods).mul(100).round(2)
+    )
 
     return df
 
@@ -383,6 +408,27 @@ def generate_financial_advice(
         overall = "🚨 全面未達標：獲利能力與成長動能均低於目標，基本面偏弱"
         detail  = "建議觀望，待財務指標回升至目標水準後再考慮介入。"
 
+    # ── 4. 三率三升覆蓋判斷（最高優先權）────────────
+    # 毛利率、營業利益率、淨利率三者皆較前一期提升 → 最高評價
+    prev = df.iloc[-2]
+    def _rate_rose(col: str) -> bool:
+        try:
+            v_now  = float(latest[col])
+            v_prev = float(prev[col])
+            return not pd.isna(v_now) and not pd.isna(v_prev) and v_now > v_prev
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    gm_rose = _rate_rose("gross_margin")
+    om_rose = _rate_rose("operating_margin")   # 若無欄位，_rate_rose 回 False
+    nm_rose = _rate_rose("net_margin")
+
+    if gm_rose and om_rose and nm_rose:
+        overall = "🔥 三率三升：本業與業外獲利全面爆發"
+        detail  = (
+            "毛利率、營業利益率、淨利率三者均較上期提升，獲利品質全面改善，基本面極強。"
+        )
+
     return {
         "margin_signal": margin_signal,
         "growth_signal": growth_signal,
@@ -417,6 +463,7 @@ def build_combo_chart(
     # 折線圖資料：保留 NaN（Plotly 自動斷線，語意更正確）
     gm_vals  = df["gross_margin"].tolist()
     nm_vals  = df["net_margin"].tolist()
+    om_vals  = df["operating_margin"].tolist() if "operating_margin" in df.columns else None
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -474,6 +521,28 @@ def build_combo_chart(
         ),
         secondary_y=True,
     )
+
+    # ── 營業利益率（%）（綠線 + 數值標籤，有資料才繪製）
+    if om_vals is not None:
+        fig.add_trace(
+            go.Scatter(
+                name="營業利益率 (%)",
+                x=periods,
+                y=om_vals,
+                mode="lines+markers+text",
+                line=dict(color="#2E7D32", width=2.5),
+                marker=dict(size=7),
+                text=[f"{v:.1f}%" if not pd.isna(v) else "" for v in om_vals],
+                textposition="top right",
+                connectgaps=False,
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "營業利益率：%{y:.1f}%"
+                    "<extra></extra>"
+                ),
+            ),
+            secondary_y=True,
+        )
 
     # ── 淨利率（%）（紅線 + 數值標籤）
     fig.add_trace(
@@ -587,7 +656,7 @@ def analyze_financials(
     if df_income is None or df_income.empty:
         return None
 
-    metrics_df = _extract_key_metrics(df_income)
+    metrics_df = _extract_key_metrics(df_income, quarterly=quarterly, is_tw=is_tw)
     if metrics_df is None or len(metrics_df) < 2:
         return None
 
@@ -812,12 +881,14 @@ def render_financial_page() -> None:
                 div  = 1e8 if analysis["is_tw"] else 1e9
                 unit = "億" if analysis["is_tw"] else "B"
 
-                for c in ["revenue", "gross_profit", "net_income"]:
-                    disp[c] = (disp[c] / div).round(2).astype(str) + f" {unit}"
-                for c in ["gross_margin", "net_margin", "revenue_growth"]:
-                    disp[c] = disp[c].apply(
-                        lambda v: f"{float(v):.2f}%" if not pd.isna(v) else "—"
-                    )
+                for c in ["revenue", "gross_profit", "operating_income", "net_income"]:
+                    if c in disp.columns:
+                        disp[c] = (disp[c] / div).round(2).astype(str) + f" {unit}"
+                for c in ["gross_margin", "operating_margin", "net_margin", "revenue_growth"]:
+                    if c in disp.columns:
+                        disp[c] = disp[c].apply(
+                            lambda v: f"{float(v):.2f}%" if not pd.isna(v) else "—"
+                        )
 
                 # 套用中英對照表重命名欄位
                 disp = disp.rename(columns=_METRICS_COL_ZH)

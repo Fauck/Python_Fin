@@ -19,14 +19,19 @@ from utils import fetch_stock_candles, get_fugle_client
 # ═════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
-def fetch_institutional_trading(symbol: str, days: int = 60) -> pd.DataFrame:
+def fetch_institutional_trading(
+    symbol: str,
+    days: int = 60,
+    start_date: Optional[str] = None,
+) -> pd.DataFrame:
     """
     取得三大法人每日買賣超（千張）。
 
     Parameters
     ----------
-    symbol : 股票代號
-    days   : 回查日曆天數，預設 60 天
+    symbol     : 股票代號
+    days       : 回查日曆天數（start_date 未指定時使用），預設 60 天
+    start_date : 明確的起始日期字串 "YYYY-MM-DD"；指定時優先於 days 計算
 
     Returns
     -------
@@ -36,7 +41,11 @@ def fetch_institutional_trading(symbol: str, days: int = 60) -> pd.DataFrame:
     try:
         client    = get_fugle_client()
         date_to   = datetime.today().strftime("%Y-%m-%d")
-        date_from = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        date_from = (
+            start_date
+            if start_date is not None
+            else (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        )
 
         raw = client.stock.historical.institutional(  # type: ignore[attr-defined]
             **{"symbol": symbol, "from": date_from, "to": date_to}
@@ -131,15 +140,22 @@ def fetch_dividends(symbol: str) -> Optional[Dict[str, Any]]:
         df[cash_col] = pd.to_numeric(df[cash_col], errors="coerce")
         df = df.dropna(subset=[cash_col])
 
+        # 先按「年度」加總現金股利（修正季配 / 半年配重複計算問題）
         if year_col:
-            df = df.sort_values(year_col, ascending=False).head(3)
+            df["_year"] = pd.DatetimeIndex(
+                pd.to_datetime(df[year_col], errors="coerce")
+            ).year
         else:
-            df = df.tail(3)
+            # 無日期欄位時以列序替代（資料通常已按年排列）
+            df["_year"] = range(len(df))
 
-        if df.empty:
+        annual = df.groupby("_year")[cash_col].sum()
+        annual = annual.sort_index(ascending=False).head(3)  # 取最近 3 年
+
+        if annual.empty:
             return None
 
-        return {"avg_cash_3yr": round(float(df[cash_col].mean()), 2)}
+        return {"avg_cash_3yr": round(float(annual.mean()), 2)}
 
     except Exception:
         return None
@@ -196,11 +212,11 @@ def analyze_highlights(df_insti: pd.DataFrame) -> List[str]:
                 if c in df_insti.columns]
     if net_cols and len(df_insti) >= 5:
         total_net = float(df_insti.tail(5)[net_cols].sum().sum())
-        if total_net > 50:
+        if total_net > 5:
             highlights.append(
                 f"✅ 近 5 日三大法人合計淨買超 {total_net:.0f} 千張"
             )
-        elif total_net < -50:
+        elif total_net < -5:
             highlights.append(
                 f"⚠️ 近 5 日三大法人合計淨賣超 {abs(total_net):.0f} 千張"
             )
@@ -218,6 +234,10 @@ def _render_insti_chart(
     symbol: str,
 ) -> None:
     """繪製 K 線 + 三大法人買賣超疊加雙列子圖。"""
+    # 將日期統一轉為字串（category 軸），消除週末假日造成的空白斷層
+    candle_x = pd.DatetimeIndex(df_candle["date"]).strftime("%Y-%m-%d")
+    insti_x  = pd.DatetimeIndex(df_insti["date"]).strftime("%Y-%m-%d")
+
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
@@ -228,7 +248,7 @@ def _render_insti_chart(
     # ── Row 1：K 線 ──────────────────────────────
     fig.add_trace(
         go.Candlestick(
-            x=df_candle["date"],
+            x=candle_x,
             open=df_candle["open"],
             high=df_candle["high"],
             low=df_candle["low"],
@@ -257,7 +277,7 @@ def _render_insti_chart(
         ]
         fig.add_trace(
             go.Bar(
-                x=df_insti["date"],
+                x=insti_x,
                 y=df_insti[col_name],
                 name=label,
                 marker_color=bar_colors,
@@ -276,6 +296,8 @@ def _render_insti_chart(
         paper_bgcolor="white",
         plot_bgcolor="white",
     )
+    # category 軸：連續排列交易日，不留假日空白
+    fig.update_xaxes(type="category", showgrid=True, gridcolor="#f0f0f0")
     fig.update_yaxes(title_text="收盤價", row=1, col=1,
                      gridcolor="#f0f0f0", showgrid=True)
     fig.update_yaxes(title_text="千張", row=2, col=1,
@@ -330,7 +352,13 @@ def render_chips_page() -> None:
                 limit=days,
                 fields="open,high,low,close,volume",
             )
-            df_insti = fetch_institutional_trading(symbol=symbol, days=days)
+            # 以 K 線第一筆日期對齊籌碼資料起始點，消除時間軸錯位
+            candle_start: Optional[str] = None
+            if not df_candle.empty and "date" in df_candle.columns:
+                candle_start = pd.Timestamp(str(df_candle.iloc[0]["date"])).strftime("%Y-%m-%d")
+            df_insti = fetch_institutional_trading(
+                symbol=symbol, days=days, start_date=candle_start
+            )
             div_data = fetch_dividends(symbol=symbol)
 
         if df_candle.empty:

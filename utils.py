@@ -306,3 +306,77 @@ def compute_macd(
     df["macd_signal"] = df["macd_line"].ewm(span=signal, adjust=False).mean().round(4)
     df["macd_hist"]   = (df["macd_line"] - df["macd_signal"]).round(4)
     return df
+
+
+def detect_all_candlestick_patterns(df: pd.DataFrame) -> List[str]:
+    """
+    使用 pandas-ta cdl_pattern 偵測最新一個交易日觸發的所有酒田戰法型態。
+
+    Parameters
+    ----------
+    df : 含 open/high/low/close 欄位的 DataFrame（日期升冪）；需至少 10 筆資料
+
+    Returns
+    -------
+    List[str]  —  每筆格式為 "🟢 中文名稱" 或 "🔴 中文名稱"；無訊號時回傳空串列
+    """
+    required = {"open", "high", "low", "close"}
+    if not required.issubset(df.columns) or len(df) < 10:
+        return []
+
+    # ── 常見型態翻譯對照表（前綴比對，相容 CDL_XXX_params 格式）──
+    _CDL_ZH: List[tuple] = [
+        ("CDL_ENGULFING",      "吞噬型態"),
+        ("CDL_MORNINGSTAR",    "晨星"),
+        ("CDL_EVENINGSTAR",    "夜星"),
+        ("CDL_HAMMER",         "錘子線"),
+        ("CDL_SHOOTINGSTAR",   "流星/避雷針"),
+        ("CDL_DOJI",           "十字星"),
+        ("CDL_SPINNINGTOP",    "紡錘線"),
+        ("CDL_MARUBOZU",       "光頭光腳大實體"),
+        ("CDL_HARAMI",         "孕育型態"),
+        ("CDL_PIERCING",       "貫穿型態"),
+        ("CDL_DARKCLOUDCOVER", "烏雲罩頂"),
+        ("CDL_3BLACKCROWS",    "三隻烏鴉"),
+        ("CDL_3WHITESOLDIERS", "三白兵"),
+        ("CDL_INVERTEDHAMMER", "倒錘子線"),
+        ("CDL_HANGINGMAN",     "上吊線"),
+    ]
+
+    def _col_to_zh(col: str) -> str:
+        """欄位名稱 → 繁體中文，未收錄則保留英文名稱（去掉 CDL_ 前綴與數值後綴）。"""
+        for prefix, zh in _CDL_ZH:
+            if col.startswith(prefix):
+                return zh
+        # 未收錄：去掉 CDL_ 前綴並清除純數字 token
+        raw = col[4:] if col.startswith("CDL_") else col
+        parts = [p for p in raw.split("_") if not p.replace(".", "").isdigit()]
+        return " ".join(parts).title() if parts else col
+
+    try:
+        import pandas_ta as pta  # type: ignore[import]
+
+        # 取最近 40 根即足夠所有 CDL 暖機；reset_index 確保 RangeIndex
+        sub = df.tail(40).copy().reset_index(drop=True)
+
+        cdl_df = pta.cdl_pattern(
+            sub["open"], sub["high"], sub["low"], sub["close"], name="all"
+        )
+        if cdl_df is None or cdl_df.empty:
+            return []
+
+        latest = cdl_df.iloc[-1]
+        results: List[str] = []
+
+        for col in latest.index:
+            val = latest[col]
+            if pd.isna(val) or val == 0:
+                continue
+            emoji   = "🟢" if val > 0 else "🔴"
+            zh_name = _col_to_zh(str(col))
+            results.append(f"{emoji} {zh_name}")
+
+        return results
+
+    except Exception:
+        return []
