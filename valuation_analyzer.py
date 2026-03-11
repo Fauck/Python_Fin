@@ -5,25 +5,31 @@
 設計原則
 --------
 - 100% 使用者主動觸發（無任何排程或背景任務）
-- 資料來源：
-    * 每日收盤價      → yfinance
-    * 配息記錄        → Fugle API（台股）/ yfinance 回退
-    * 季度 EPS/BVPS  → yfinance quarterly_income_stmt / quarterly_balance_sheet
+- 資料來源（台股限定）：
+    * 每日收盤價      → Fugle historical candles（fetch_stock_candles）
+    * 配息記錄        → FinMind TaiwanStockDividendResult
+    * 季度 EPS        → FinMind TaiwanStockFinancialStatements（type="EPS"）→ TTM
+    * 季度 BVPS       → FinMind TaiwanStockFinancialStatements（type="每股參考淨值" 等）
 - TTM (Trailing Twelve Months)：近四季滾動 EPS，河流圖呈平滑波浪
 - @st.cache_data(ttl=3600) 快取避免重複呼叫
 - st.session_state 保存查詢結果，避免圖表因互動消失
 """
 
 import re
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-import yfinance as yf
 
-from utils import get_fugle_client
+from utils import fetch_stock_candles
+
+# ── FinMind API 設定
+_FINMIND_URL     = "https://api.finmindtrade.com/api/v4/data"
+_FINMIND_DATASET = "TaiwanStockFinancialStatements"
 
 
 # ── 台股代號識別（4~6 位純數字）
@@ -78,7 +84,7 @@ def _find_row(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
 
 def _row_to_series(row: pd.Series) -> pd.Series:
     """
-    將 yfinance 財報 DataFrame 的一行（columns = Timestamps）
+    將財報 DataFrame 的一行（columns = Timestamps）
     轉為日期升冪索引的 pd.Series[float]。
     """
     data: Dict[pd.Timestamp, float] = {}
@@ -144,63 +150,46 @@ def _five_equal_levels(
 
 
 # ═════════════════════════════════════════════
-# Fugle 配息資料（台股優先來源）
+# FinMind 配息資料
 # ═════════════════════════════════════════════
 
-def _fetch_dividends_fugle(symbol: str) -> Optional[pd.Series]:
+def _fetch_dividends_finmind(symbol: str, years: int) -> Optional[pd.Series]:
     """
-    透過 Fugle API 取得台股歷史配息，回傳以年度結尾日為索引的年度現金配息 Series。
-    失敗時回傳 None（交由上層 fallback 至 yfinance）。
+    透過 FinMind TaiwanStockDividendResult 取得台股歷史現金配息，
+    回傳以年度結尾日（YYYY-12-31）為索引的年度現金配息 Series。
+    失敗 / 無配息記錄時回傳 None。
 
-    Fugle dividends 資料格式（動態欄位名稱，以模式比對）：
-    - 現金股利欄：含 "cash" + "div" 的欄位
-    - 日期欄    ：含 "date" 或 "year" 的欄位
+    FinMind 現金股利由兩欄組成：
+        CashEarningsDistribution       — 盈餘配息
+        CashStatutorySurplusDistribution — 公積配息
     """
+    start_date = (datetime.today() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
     try:
-        client = get_fugle_client()
-        raw = client.stock.historical.dividends(  # type: ignore[attr-defined]
-            **{"symbol": symbol}
+        resp = requests.get(
+            _FINMIND_URL,
+            params={"dataset": "TaiwanStockDividendResult", "data_id": symbol, "start_date": start_date},
+            timeout=30,
         )
-
-        records: List[dict] = []
-        if isinstance(raw, dict):
-            records = list(raw.get("data", []))
-        elif isinstance(raw, list):
-            records = list(raw)
-
+        records = resp.json().get("data", [])
         if not records:
             return None
 
         df = pd.DataFrame(records)
+        df["date"] = pd.to_datetime(df.get("date", pd.Series(dtype=str)), errors="coerce")
 
-        # 找現金股利欄
-        cash_col: Optional[str] = next(
-            (c for c in df.columns if "cash" in c.lower() and "div" in c.lower()),
-            next((c for c in df.columns if "cash" in c.lower()), None),
-        )
-        # 找日期欄
-        date_col: Optional[str] = next(
-            (c for c in df.columns if "date" in c.lower()),
-            next((c for c in df.columns if "year" in c.lower()), None),
-        )
+        # 合併兩個現金股利欄位
+        df["cash_dividend"] = 0.0
+        for col in ["CashEarningsDistribution", "CashStatutorySurplusDistribution"]:
+            if col in df.columns:
+                df["cash_dividend"] += pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-        if cash_col is None or date_col is None:
-            return None
-
-        df[cash_col] = pd.to_numeric(df[cash_col], errors="coerce")
-        df = df.dropna(subset=[cash_col])
-        df = df[df[cash_col] > 0]
-
+        df = df.dropna(subset=["date"])
+        df = df[df["cash_dividend"] > 0]
         if df.empty:
             return None
 
-        # 日期欄轉型
-        df[date_col] = pd.to_datetime(df[date_col].astype(str), errors="coerce")
-        df = df.dropna(subset=[date_col])
-
-        # 依年加總（同一年可能有多次配息）
-        df["_year"] = pd.DatetimeIndex(df[date_col]).year
-        annual = df.groupby("_year")[cash_col].sum()
+        # 依年加總（同一年可能多次配息）
+        annual = df.groupby(pd.DatetimeIndex(df["date"]).year)["cash_dividend"].sum()
 
         # 轉換為年底日期索引
         idx = pd.DatetimeIndex([f"{y}-12-31" for y in annual.index])
@@ -210,8 +199,127 @@ def _fetch_dividends_fugle(symbol: str) -> Optional[pd.Series]:
         return None
 
 
+def _fetch_finmind_quarterly(symbol: str, years: int = 3) -> pd.DataFrame:
+    """
+    呼叫 FinMind TaiwanStockFinancialStatements，回傳近 years 年季報 long-format DataFrame。
+
+    欄位：date（Timestamp）、type（科目名）、value（float）
+    失敗 / 無資料時回傳空 DataFrame。
+    """
+    start_date = (
+        datetime.today() - timedelta(days=years * 365)
+    ).strftime("%Y-%m-%d")
+    try:
+        resp = requests.get(
+            _FINMIND_URL,
+            params={
+                "dataset":    _FINMIND_DATASET,
+                "data_id":    symbol,
+                "start_date": start_date,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        records = resp.json().get("data", [])
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        df["value"] = pd.to_numeric(df.get("value", pd.Series(dtype=float)), errors="coerce")
+        df["date"]  = pd.to_datetime(df.get("date",  pd.Series(dtype=str)),  errors="coerce")
+        return df.dropna(subset=["date", "value"])
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fetch_eps_finmind(symbol: str, price_df: pd.DataFrame, years: int = 3) -> pd.Series:
+    """
+    透過 FinMind TaiwanStockFinancialStatements（type=="EPS"）取得季度 EPS，
+    計算 TTM 四季滾動 EPS Series 並對齊每日。
+
+    注意：
+    - API 無資料或解析失敗 → 回傳空 Series，絕不誤判為 EPS ≤ 0
+    - TTM = 近四季 EPS 加總（需至少 4 季資料，否則回傳空 Series）
+    """
+    empty = pd.Series(dtype=float, index=price_df.index)
+    try:
+        df_long = _fetch_finmind_quarterly(symbol, years=years)
+        if df_long.empty:
+            return empty  # API 無資料，非 EPS <= 0
+
+        eps_df = df_long[df_long["type"] == "EPS"].copy()
+        if eps_df.empty:
+            return empty  # 此標的無 EPS 科目
+
+        eps_df = eps_df.dropna(subset=["date", "value"])
+        if eps_df.empty:
+            return empty
+
+        q_series = pd.Series(
+            eps_df["value"].values,
+            index=pd.DatetimeIndex(eps_df["date"]).tz_localize(None),
+        ).sort_index()
+
+        return _compute_ttm_quarterly(q_series, price_df)
+
+    except Exception:
+        return empty  # 任何例外 → 安全回傳空 Series
+
+
+def _fetch_bvps_finmind(symbol: str, price_df: pd.DataFrame, years: int = 3) -> pd.Series:
+    """
+    透過 FinMind TaiwanStockBalanceSheet 取得每股淨值（BVPS），
+    前向填充至每日。
+
+    搜尋順序（type 欄位精確比對）：
+        每股參考淨值 → 每股淨值 → BookValuePerShare → BVPS → 每股帳面價值
+    失敗 / 無資料 → 回傳空 Series。
+    """
+    empty = pd.Series(dtype=float, index=price_df.index)
+    _BVPS_TYPES = ["每股參考淨值", "每股淨值", "BookValuePerShare", "BVPS", "每股帳面價值"]
+    try:
+        start_date = (datetime.today() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
+        resp = requests.get(
+            _FINMIND_URL,
+            params={"dataset": "TaiwanStockBalanceSheet", "data_id": symbol, "start_date": start_date},
+            timeout=30,
+        )
+        records = resp.json().get("data", [])
+        if not records:
+            return empty
+
+        df_long = pd.DataFrame(records)
+        df_long["value"] = pd.to_numeric(df_long.get("value", pd.Series(dtype=float)), errors="coerce")
+        df_long["date"]  = pd.to_datetime(df_long.get("date",  pd.Series(dtype=str)),  errors="coerce")
+
+        bvps_df = pd.DataFrame()
+        for t in _BVPS_TYPES:
+            filtered = df_long[df_long["type"] == t]
+            if not filtered.empty:
+                bvps_df = filtered.copy()
+                break
+
+        if bvps_df.empty:
+            return empty
+
+        bvps_df = bvps_df.dropna(subset=["date", "value"])
+        bvps_df = bvps_df[bvps_df["value"] > 0]
+        if bvps_df.empty:
+            return empty
+
+        q_series = pd.Series(
+            bvps_df["value"].values,
+            index=pd.DatetimeIndex(bvps_df["date"]).tz_localize(None),
+        ).sort_index()
+        return _align_to_daily(q_series, price_df)
+
+    except Exception:
+        return empty
+
+
 # ═════════════════════════════════════════════
-# 資料層：yfinance + Fugle 混合抓取
+# 資料層：Fugle 全資料抓取
 # ═════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
@@ -220,21 +328,21 @@ def fetch_valuation_data(
     years: int = 5,
 ) -> Optional[Dict[str, Any]]:
     """
-    取得估值分析所需歷史資料。
+    取得估值分析所需歷史資料（Fugle API，台股限定）。
 
     資料來源策略
     -----------
-    - 每日收盤價    : yfinance history()（.TW / .TWO 自動識別）
-    - 季度 EPS      : yfinance quarterly_income_stmt → TTM rolling 4Q
-    - 季度 BVPS     : yfinance quarterly_balance_sheet（最新季前向填充）
-    - 年度配息      : Fugle API dividends（台股）→ fallback yfinance dividends
+    - 每日收盤價    : Fugle historical candles（fetch_stock_candles）
+    - 季度 EPS      : Fugle historical.eps() → TTM rolling 4Q
+    - 季度 BVPS     : Fugle historical.financials(balance, quarter) → 每股淨值欄
+    - 年度配息      : Fugle corporate_actions.dividends()
 
     Returns
     -------
-    None（抓取失敗）或 dict：
+    None（非台股代號 / 資料抓取失敗）或 dict：
         symbol_full   : str
         price_df      : DataFrame (DatetimeIndex, col="close")
-        eps_daily     : Series  — TTM EPS daily（或季度 fallback）
+        eps_daily     : Series  — TTM EPS daily
         bvps_daily    : Series  — 季度 BVPS daily
         div_annual    : Series  — 年度配息
         div_daily     : Series  — 年度配息前向填充至每日
@@ -242,160 +350,55 @@ def fetch_valuation_data(
         current_eps   : float | None
         current_bvps  : float | None
         current_div   : float | None
-        info          : dict
     """
     raw   = symbol.strip().upper()
     is_tw = bool(_TW_CODE_RE.match(raw))
-    candidates = [f"{raw}.TW", f"{raw}.TWO"] if is_tw else [raw]
 
-    # ── 1. 每日收盤價（yfinance）────────────────────────────────
-    tk: Optional[yf.Ticker] = None
-    price_df   = pd.DataFrame()
-    info: Dict[str, Any] = {}
-    resolved   = raw
-
-    for sym in candidates:
-        try:
-            candidate = yf.Ticker(sym)
-            hist = candidate.history(period=f"{years}y", auto_adjust=True)
-            if hist.empty:
-                continue
-            tk       = candidate
-            resolved = sym
-            price_df = hist[["Close"]].rename(columns={"Close": "close"})
-            price_df.index = pd.DatetimeIndex(price_df.index).tz_localize(None)
-            try:
-                info = tk.info or {}
-            except Exception:
-                info = {}
-            break
-        except Exception:
-            continue
-
-    if price_df.empty:
+    # 台股限定：非台股代號直接回傳 None
+    if not is_tw:
         return None
+
+    # ── 1. 每日收盤價（Fugle candles）────────────────────────────
+    limit     = years * 300   # ~250 交易日/年 + 緩衝
+    date_to   = datetime.today().strftime("%Y-%m-%d")
+    date_from = (datetime.today() - timedelta(days=years * 365 + 60)).strftime("%Y-%m-%d")
+
+    df_candle = fetch_stock_candles(
+        symbol=raw, limit=limit,
+        date_from=date_from, date_to=date_to,
+        fields="open,high,low,close,volume",
+    )
+    if df_candle.empty or "close" not in df_candle.columns:
+        return None
+
+    price_df = df_candle[["date", "close"]].copy()
+    price_df["date"] = pd.to_datetime(price_df["date"])
+    price_df = price_df.set_index("date")
+    price_df.index = pd.DatetimeIndex(price_df.index).tz_localize(None)
 
     current_price = _to_float(price_df["close"].iloc[-1])
     if current_price is None:
         return None
 
-    # ── 2. 季度 EPS → TTM（yfinance quarterly_income_stmt）─────
-    eps_daily: pd.Series = pd.Series(dtype=float, index=price_df.index)
-
-    if tk is not None:
-        try:
-            q_inc = getattr(tk, "quarterly_income_stmt", None) or \
-                    getattr(tk, "quarterly_financials",  None)
-            if isinstance(q_inc, pd.DataFrame) and not q_inc.empty:
-                eps_row = _find_row(q_inc, ["Basic EPS", "Diluted EPS"])
-                if eps_row is not None:
-                    eps_daily = _compute_ttm_quarterly(_row_to_series(eps_row), price_df)
-                else:
-                    # Fallback：淨利 / 股數
-                    ni_row = _find_row(q_inc, [
-                        "Net Income", "Net Income Common Stockholders",
-                    ])
-                    shares = _to_float(info.get("sharesOutstanding"))
-                    if ni_row is not None and shares and shares > 0:
-                        q_eps = _row_to_series(ni_row) / shares
-                        eps_daily = _compute_ttm_quarterly(q_eps, price_df)
-        except Exception:
-            pass
-
-    # Fallback 2：年報 EPS（Basic/Diluted 或 Net Income / shares）
-    if eps_daily.dropna().empty and tk is not None:
-        try:
-            a_inc = getattr(tk, "income_stmt", None) or \
-                    getattr(tk, "financials",    None)
-            if isinstance(a_inc, pd.DataFrame) and not a_inc.empty:
-                eps_row = _find_row(a_inc, ["Basic EPS", "Diluted EPS"])
-                if eps_row is not None:
-                    eps_daily = _align_to_daily(_row_to_series(eps_row), price_df)
-                else:
-                    # 年報 Net Income / shares（台股常見格式）
-                    ni_row = _find_row(a_inc, [
-                        "Net Income", "Net Income Common Stockholders",
-                    ])
-                    shares_a = _to_float(info.get("sharesOutstanding"))
-                    if ni_row is not None and shares_a and shares_a > 0:
-                        eps_a = _row_to_series(ni_row) / shares_a
-                        eps_daily = _align_to_daily(eps_a, price_df)
-        except Exception:
-            pass
-
-    # Fallback 3：用 trailingEps 建立水平基準線（帶線為等距水平，仍可診斷當前估值）
-    if eps_daily.dropna().empty:
-        trailing = _to_float(info.get("trailingEps"))
-        if trailing is not None and trailing > 0:
-            eps_daily = pd.Series(trailing, index=price_df.index, dtype=float)
-
-    current_eps = _to_float(info.get("trailingEps")) or (
-        _to_float(eps_daily.dropna().iloc[-1]) if not eps_daily.dropna().empty else None
+    # ── 2. 季度 EPS → TTM（FinMind EPS API）────────────────────────
+    eps_daily: pd.Series = _fetch_eps_finmind(raw, price_df, years=years)
+    current_eps = (
+        _to_float(eps_daily.dropna().iloc[-1])
+        if not eps_daily.dropna().empty else None
     )
 
-    # ── 3. BVPS（季報 → 年報 → bookValue 水平線，三層 fallback）──
-    bvps_daily: pd.Series = pd.Series(dtype=float, index=price_df.index)
-    _EQ_ROWS = [
-        "Stockholders Equity", "Total Stockholder Equity",
-        "Common Stock Equity", "Total Equity Gross Minority Interest",
-    ]
-
-    if tk is not None:
-        shares = _to_float(info.get("sharesOutstanding"))
-        if shares and shares > 0:
-            # Fallback 1：季報
-            try:
-                q_bs = getattr(tk, "quarterly_balance_sheet", None)
-                if isinstance(q_bs, pd.DataFrame) and not q_bs.empty:
-                    eq_row = _find_row(q_bs, _EQ_ROWS)
-                    if eq_row is not None:
-                        bvps_daily = _align_to_daily(
-                            _row_to_series(eq_row) / shares, price_df
-                        )
-            except Exception:
-                pass
-
-            # Fallback 2：年報
-            if bvps_daily.dropna().empty:
-                try:
-                    a_bs = getattr(tk, "balance_sheet", None)
-                    if isinstance(a_bs, pd.DataFrame) and not a_bs.empty:
-                        eq_row = _find_row(a_bs, _EQ_ROWS)
-                        if eq_row is not None:
-                            bvps_daily = _align_to_daily(
-                                _row_to_series(eq_row) / shares, price_df
-                            )
-                except Exception:
-                    pass
-
-    # Fallback 3：bookValue 水平基準線
-    if bvps_daily.dropna().empty:
-        book_val = _to_float(info.get("bookValue"))
-        if book_val is not None and book_val > 0:
-            bvps_daily = pd.Series(book_val, index=price_df.index, dtype=float)
-
-    current_bvps = _to_float(info.get("bookValue")) or (
-        _to_float(bvps_daily.dropna().iloc[-1]) if not bvps_daily.dropna().empty else None
+    # ── 3. BVPS（FinMind balance sheet quarterly）────────────────
+    bvps_daily: pd.Series = _fetch_bvps_finmind(raw, price_df, years=years)
+    current_bvps = (
+        _to_float(bvps_daily.dropna().iloc[-1])
+        if not bvps_daily.dropna().empty else None
     )
 
-    # ── 4. 年度配息（Fugle 優先，回退 yfinance）────────────────
+    # ── 4. 年度配息（FinMind TaiwanStockDividendResult）──────────
     div_annual: pd.Series = pd.Series(dtype=float)
-
-    if is_tw:
-        fugle_divs = _fetch_dividends_fugle(raw)
-        if fugle_divs is not None and not fugle_divs.empty:
-            div_annual = fugle_divs
-
-    if div_annual.empty and tk is not None:
-        try:
-            raw_div = tk.dividends
-            if isinstance(raw_div, pd.Series) and not raw_div.empty:
-                divs = raw_div.copy()
-                divs.index = pd.DatetimeIndex(divs.index).tz_localize(None)
-                yearly = divs.resample("YE").sum()
-                div_annual = yearly[yearly > 0]
-        except Exception:
-            pass
+    finmind_divs = _fetch_dividends_finmind(raw, years)
+    if finmind_divs is not None and not finmind_divs.empty:
+        div_annual = finmind_divs
 
     div_daily: pd.Series = pd.Series(dtype=float, index=price_df.index)
     if not div_annual.empty:
@@ -406,17 +409,16 @@ def fetch_valuation_data(
     )
 
     return {
-        "symbol_full":  resolved,
-        "price_df":     price_df,
-        "eps_daily":    eps_daily,    # TTM EPS（或年度 fallback），已對齊每日
-        "bvps_daily":   bvps_daily,   # 季度 BVPS，已對齊每日
-        "div_annual":   div_annual,
-        "div_daily":    div_daily,
+        "symbol_full":   raw,
+        "price_df":      price_df,
+        "eps_daily":     eps_daily,    # TTM EPS，已對齊每日
+        "bvps_daily":    bvps_daily,   # 季度 BVPS，已對齊每日
+        "div_annual":    div_annual,
+        "div_daily":     div_daily,
         "current_price": current_price,
-        "current_eps":  current_eps,
-        "current_bvps": current_bvps,
-        "current_div":  current_div,
-        "info":         info,
+        "current_eps":   current_eps,
+        "current_bvps":  current_bvps,
+        "current_div":   current_div,
     }
 
 
@@ -788,8 +790,7 @@ def _render_results(cache: Dict[str, Any]) -> None:
 
     st.markdown(f"##### {resolved} &nbsp; 估值分析（近 {years} 年）")
     st.caption(
-        f"資料來源：Yahoo Finance (yfinance) ＋ Fugle API ｜ "
-        f"現價：{current_price:,.2f}"
+        f"收盤價：Fugle API ｜ EPS／BVPS／配息：FinMind API ｜ 現價：{current_price:,.2f}"
     )
 
     if is_custom:
@@ -862,10 +863,7 @@ def render_valuation_page() -> None:
                 value="2330",
                 max_chars=20,
                 key="val_symbol",
-                help=(
-                    "台股輸入 4-6 位數字（如 2330），系統自動嘗試 .TW / .TWO。\n"
-                    "美股輸入英文代號（如 AAPL）。"
-                ),
+                help="僅支援台灣股票。輸入 4-6 位數字代號（如 2330、6278）。",
             ).strip()
             years: int = st.select_slider(
                 "歷史年數",
@@ -951,8 +949,10 @@ def render_valuation_page() -> None:
             if data is None:
                 st.warning(
                     f"查無 **{symbol}** 的歷史資料。\n\n"
-                    "可能原因：代號錯誤、Yahoo Finance 尚未收錄此標的、"
-                    "或目前網路連線不穩定。"
+                    "可能原因：\n"
+                    "- 非台股代號（本功能僅支援台灣股票，請輸入 4-6 位數字代號）\n"
+                    "- 代號錯誤或 Fugle API 尚未收錄此標的\n"
+                    "- 目前網路連線不穩定，請稍後再試"
                 )
                 st.session_state["val_cache"] = None
 
@@ -962,13 +962,13 @@ def render_valuation_page() -> None:
                     "📊": (
                         f"**{data['symbol_full']}** 的本益比河流圖資料不足。\n\n"
                         "可能原因：\n"
-                        "- Yahoo Finance 未提供此標的的 EPS 季報資料\n"
-                        "- 近期出現虧損（EPS ≤ 0）\n\n"
+                        "- FinMind API 尚未收錄此標的的 EPS 季報資料\n"
+                        "- 近四季 EPS 有效資料不足（TTM 需至少 4 季）\n\n"
                         "建議改用「淨值比河流圖」或「殖利率通道」。"
                     ),
                     "📚": (
                         f"**{data['symbol_full']}** 的淨值比河流圖資料不足。\n\n"
-                        "可能原因：Yahoo Finance 未提供每股淨值季報資料。\n\n"
+                        "可能原因：FinMind API 尚未收錄每股淨值季報資料。\n\n"
                         "建議改用「本益比」或確認代號是否正確。"
                     ),
                     "💰": (
@@ -1007,17 +1007,17 @@ def render_valuation_page() -> None:
     if cache is None and not query_btn:
         st.info(
             "請在上方輸入股票代號，選擇估值方法後點擊「查詢估值」。\n\n"
+            "**支援範圍**：台灣上市上櫃股票（4-6 位數字代號，如 2330、6278）\n\n"
             "**三種估值方法說明**\n\n"
             "| 方法 | 適用標的 |\n"
             "|------|----------|\n"
             "| 本益比河流 (P/E) | 成長股、科技股、有穩定 EPS 者 |\n"
             "| 淨值比河流 (P/B) | 金融股、景氣循環股、資產股 |\n"
             "| 殖利率通道 | 高股息 ETF（0056、00878）、配息穩定存股標的 |\n\n"
-            "**升級說明**\n\n"
+            "**資料說明**\n\n"
             "- P/E 帶線採用 **TTM（近四季滾動 EPS）**，呈現平滑波浪而非階梯\n"
-            "- 配息資料優先使用 **Fugle API**（台股），準確度更高\n"
             "- 圖表縮放、互動後結果**不會消失**（session_state 保存）\n\n"
-            "**資料來源：** Yahoo Finance (yfinance) ＋ Fugle Market Data API"
+            "**資料來源：** 收盤價 → Fugle API ｜ EPS / BVPS / 配息 → FinMind API"
         )
     elif cache is not None:
         _render_results(cache)

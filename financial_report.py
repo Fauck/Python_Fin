@@ -1,26 +1,25 @@
 """
 企業財務報告頁面（Tab 6）。
-使用 yfinance 取得損益表、資產負債表、現金流量表。
-並提供關鍵財務指標分析、雙軸組合圖表及量化投資診斷。
+使用 FinMind API 取得損益表並提供關鍵財務指標分析、雙軸組合圖表及量化投資診斷。
 
 台股財報注意事項
 ---------------
-- 資料來源：Yahoo Finance（yfinance 爬取），非即時官方資料
-- 財報延遲：最新一季財報可能延遲 2-8 週才更新至 Yahoo Finance
-- 缺漏欄位：Yahoo Finance 對中小型台股的科目收錄不完整，顯示「—」
-- 頻率限制：Yahoo Finance 有 HTTP 429 速率限制，@st.cache_data 可降低呼叫次數
-- 台灣上市股票使用 .TW 後綴（例如 2330.TW）
-- 台灣上櫃股票使用 .TWO 後綴（例如 6278.TWO）
-  → 本模組自動嘗試 .TW，若無資料再改試 .TWO
+- 資料來源：FinMind API（https://api.finmindtrade.com/api/v4/data）
+- Dataset：TaiwanStockFinancialStatements（含 Revenue / GrossProfit / OperatingIncome 等）
+- 僅支援台灣上市上櫃股票，輸入 4-6 位數字代號（如 2330、6278）
+- 財報延遲：最新一季財報可能延遲 1-4 週才更新
+- 缺漏欄位：欄位顯示「—」表示 FinMind 未收錄該科目
+- @st.cache_data(ttl=3600) 快取可降低重複呼叫次數
 """
 
 import re
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-import yfinance as yf
 from plotly.subplots import make_subplots
 
 from financial_translations import METRICS_COL_ZH as _METRICS_COL_ZH
@@ -38,59 +37,133 @@ _DEFAULT_TARGET_DIV_YIELD:      float = 5.0    # 目標現金殖利率 (%)（保
 
 
 # ═════════════════════════════════════════════
-# 資料層：財報抓取
+# 資料層：財報抓取（FinMind API）
 # ═════════════════════════════════════════════
 
-def _get_attr(ticker: yf.Ticker, *attr_names: str) -> Optional[pd.DataFrame]:
+_FINMIND_URL          = "https://api.finmindtrade.com/api/v4/data"
+_FINMIND_DATASET      = "TaiwanStockFinancialStatements"
+_FINMIND_FETCH_YEARS  = 3   # 抓取近 3 年財報資料
+
+
+def _fetch_finmind_long(symbol: str) -> pd.DataFrame:
     """
-    依序嘗試多個 yfinance 屬性名稱，回傳第一個非空的 DataFrame。
+    呼叫 FinMind TaiwanStockFinancialStatements，回傳 long-format DataFrame。
 
-    背景：yfinance 0.2.x 將部分屬性重新命名（例如 financials → income_stmt），
-    此函式同時相容新舊 API，避免版本差異導致資料取不到。
+    回傳欄位：date（Timestamp）、type（科目名稱）、value（數值）
+    失敗時回傳空 DataFrame。
+
+    常見 type 值：
+        Revenue / GrossProfit / OperatingIncome / NetIncome / EPS ...
     """
-    for name in attr_names:
-        try:
-            df = getattr(ticker, name, None)
-            if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
-                return df
-        except Exception:
-            continue
-    return None
+    start_date = (
+        datetime.today() - timedelta(days=_FINMIND_FETCH_YEARS * 365)
+    ).strftime("%Y-%m-%d")
+    try:
+        resp = requests.get(
+            _FINMIND_URL,
+            params={
+                "dataset":    _FINMIND_DATASET,
+                "data_id":    symbol,
+                "start_date": start_date,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        records = resp.json().get("data", [])
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        df["value"] = pd.to_numeric(df.get("value", pd.Series(dtype=float)), errors="coerce")
+        df["date"]  = pd.to_datetime(df.get("date",  pd.Series(dtype=str)),  errors="coerce")
+        return df.dropna(subset=["date", "value"])
+
+    except Exception:
+        return pd.DataFrame()
 
 
-def _fetch_statements(
-    symbol_full: str,
+def _pivot_to_stmt_df(df_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    將 FinMind long-format 轉為財報分析格式：
+    index=type（科目）、columns=Timestamp（降冪，最新在左）。
+
+    此格式與 _find_row() / _extract_key_metrics() 相容。
+    """
+    if df_long.empty:
+        return pd.DataFrame()
+    try:
+        piv = df_long.pivot_table(
+            index="type", columns="date", values="value", aggfunc=lambda x: x.iloc[-1]
+        )
+        piv.columns = pd.DatetimeIndex(piv.columns)
+        return piv.sort_index(axis=1, ascending=False)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _aggregate_to_annual(df_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    將 FinMind 季度 long-format 按自然年加總，轉為年報格式。
+
+    分組邏輯：依 date 的年份分組，對同一科目的 value 加總。
+    年度欄位以「該年 12-31」Timestamp 表示，降冪排列。
+
+    注意：Revenue / GrossProfit / OperatingIncome / NetIncome / EPS
+          加總後代表全年累計值，適合年報圖表使用。
+    """
+    if df_long.empty:
+        return pd.DataFrame()
+    try:
+        tmp = df_long.copy()
+        tmp["year"] = pd.DatetimeIndex(tmp["date"]).year
+        annual = (
+            tmp.groupby(["type", "year"])["value"]
+            .sum()
+            .reset_index()
+        )
+        annual["date"] = pd.to_datetime(
+            annual["year"].astype(str) + "-12-31", errors="coerce"
+        )
+        piv = annual.pivot_table(
+            index="type", columns="date", values="value", aggfunc=lambda x: x.iloc[-1]
+        )
+        piv.columns = pd.DatetimeIndex(piv.columns)
+        return piv.sort_index(axis=1, ascending=False)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fetch_statements_finmind(
+    symbol: str,
     quarterly: bool = False,
 ) -> Dict[str, Optional[pd.DataFrame]]:
     """
-    使用 yfinance 取得三大財報（核心邏輯，不含 Streamlit 元素）。
+    透過 FinMind API 取得台股損益表（季報或年報）。
 
-    常見例外情境
+    FinMind TaiwanStockFinancialStatements 涵蓋損益表科目（Revenue、GrossProfit 等），
+    資產負債表與現金流量表不在此 dataset 內，回傳 None。
+
+    Parameters
     ----------
-    - HTTP 429：Yahoo Finance 頻率限制，呼叫端以 @st.cache_data(ttl=3600) 降低次數
-    - HTTP 404 / empty：代號錯誤或 Yahoo 未收錄
-    - AttributeError：yfinance 版本差異，以 _get_attr 多屬性嘗試處理
-    - timeout / ConnectionError：網路問題，try-except 捕獲後回傳 None
+    symbol    : 台股純數字代號（例如 "2330"），已驗證為 4-6 位
+    quarterly : True → 直接使用季度資料；False → 按年加總
     """
-    try:
-        tk = yf.Ticker(symbol_full)
-    except Exception:
-        return {"income_stmt": None, "balance_sheet": None, "cash_flow": None}
-
-    if quarterly:
-        income = _get_attr(tk, "quarterly_income_stmt", "quarterly_financials")
-        bs     = _get_attr(tk, "quarterly_balance_sheet")
-        cf     = _get_attr(tk, "quarterly_cashflow")
-    else:
-        income = _get_attr(tk, "income_stmt", "financials")
-        bs     = _get_attr(tk, "balance_sheet")
-        cf     = _get_attr(tk, "cashflow")
-
-    return {
-        "income_stmt":   income,
-        "balance_sheet": bs,
-        "cash_flow":     cf,
+    empty: Dict[str, Optional[pd.DataFrame]] = {
+        "income_stmt":   None,
+        "balance_sheet": None,
+        "cash_flow":     None,
     }
+
+    df_long = _fetch_finmind_long(symbol)
+    if df_long.empty:
+        return empty
+
+    income = _pivot_to_stmt_df(df_long) if quarterly else _aggregate_to_annual(df_long)
+    if not income.empty:
+        empty["income_stmt"]   = income
+        empty["balance_sheet"] = income
+        empty["cash_flow"]     = income
+    return empty
 
 
 @st.cache_data(ttl=3600)
@@ -99,18 +172,15 @@ def get_financial_reports(
     quarterly: bool = False,
 ) -> Tuple[Dict[str, Optional[pd.DataFrame]], str]:
     """
-    取得企業三大財務報表（含台股自動後綴識別）。
+    取得台股損益表財報（FinMind API，台股限定）。
 
-    台股自動識別流程
-    ---------------
-    1. 輸入為 4-6 位純數字（如 2330）→ 先嘗試 .TW（上市）
-    2. .TW 三張報表全空 → 改嘗試 .TWO（上櫃）
-    3. 已含後綴或英文代號（TSLA、AAPL）→ 直接使用
+    僅支援台灣上市上櫃股票（4-6 位純數字代號）。
+    非台股代號直接回傳空結果，不發出 API 請求。
 
     Parameters
     ----------
-    symbol    : 使用者輸入的股票代號（不分大小寫）
-    quarterly : True → 季報；False（預設）→ 年報
+    symbol    : 使用者輸入的股票代號
+    quarterly : True → 季報；False（預設）→ 年報（按年加總）
 
     Returns
     -------
@@ -118,17 +188,14 @@ def get_financial_reports(
     """
     symbol = symbol.strip().upper()
 
-    if _TW_CODE_RE.match(symbol):
-        resolved = f"{symbol}.TW"
-        data     = _fetch_statements(resolved, quarterly)
-        if all(v is None for v in data.values()):
-            resolved = f"{symbol}.TWO"
-            data     = _fetch_statements(resolved, quarterly)
-    else:
-        resolved = symbol
-        data     = _fetch_statements(resolved, quarterly)
+    if not _TW_CODE_RE.match(symbol):
+        empty: Dict[str, Optional[pd.DataFrame]] = {
+            "income_stmt": None, "balance_sheet": None, "cash_flow": None,
+        }
+        return empty, symbol
 
-    return data, resolved
+    data = _fetch_statements_finmind(symbol, quarterly)
+    return data, symbol
 
 
 # ═════════════════════════════════════════════
@@ -215,12 +282,11 @@ def _find_row(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
 def _extract_key_metrics(
     df_income: pd.DataFrame,
     quarterly: bool = False,
-    is_tw: bool = False,
 ) -> Optional[pd.DataFrame]:
     """
     從損益表 DataFrame 提取核心財務指標，並計算衍生欄位。
 
-    輸入：yfinance 損益表（index=科目, columns=日期，通常為降冪排列）
+    輸入：損益表（index=科目, columns=日期，通常為降冪排列）
     輸出：升冪 DataFrame，內部欄位名稱（英文）供計算使用，
           顯示時再透過 _METRICS_COL_ZH 翻譯為繁體中文：
           period / revenue / gross_profit / operating_income / net_income /
@@ -231,21 +297,30 @@ def _extract_key_metrics(
     - 若 revenue 為 0 或 NaN，各利潤率設為 NaN（避免 inf）
     - 季報 revenue_growth 使用 pct_change(periods=4) 計算 YoY 年增率
     - 年報 revenue_growth 使用 pct_change(periods=1)
-    - 台股量級防呆：最新一期營收 < 1e8 時整欄乘以 1000（千元 → 元）
     """
     revenue_row = _find_row(df_income, [
         "Total Revenue", "TotalRevenue", "Revenue", "Net Revenue",
+        "totalRevenue", "revenue", "營業收入",
     ])
     gross_row = _find_row(df_income, [
         "Gross Profit", "GrossProfit",
+        "grossProfit", "gross_profit", "毛利", "營業毛利",
     ])
     op_income_row = _find_row(df_income, [
         "Operating Income", "OperatingIncome", "Operating Profit", "EBIT",
+        "operatingIncome", "operatingProfit", "營業利益",
     ])
     net_row = _find_row(df_income, [
-        "Net Income", "NetIncome",
-        "Net Income Common Stockholders",
-        "Net Income From Continuing And Discontinued Operation",
+        "NetIncomeAttributableToOwnersOfTheParent", # FinMind 首選：歸屬於母公司業主之淨利
+        "ProfitLoss",                               # FinMind 常見：本期淨利
+        "IncomeAfterTaxes",                         # FinMind 常見：稅後淨利
+        "NetIncomeLoss",                            # FinMind 備用
+        "歸屬於母公司業主之淨利",
+        "本期淨利",
+        "稅後淨利",
+        "Net Income",
+        "NetIncome",
+        "netIncome",
     ])
 
     if revenue_row is None:
@@ -270,15 +345,8 @@ def _extract_key_metrics(
         "net_income":        _to_float_list(net_row),
     })
 
-    # yfinance 通常降冪（最新在上）→ 反轉為升冪後再計算成長率
+    # 輸入資料為降冪（最新在上）→ 反轉為升冪後再計算成長率
     df = df.iloc[::-1].reset_index(drop=True)
-
-    # ── 台股量級防呆：若最新一期營收 < 1e8，推測為千元單位，整欄乘以 1000 ──
-    if is_tw:
-        latest_rev = df["revenue"].dropna()
-        if len(latest_rev) > 0 and abs(float(latest_rev.iloc[-1])) < 1e8:
-            for col in ["revenue", "gross_profit", "operating_income", "net_income"]:
-                df[col] = df[col] * 1000
 
     # 衍生欄位：以 replace(0, nan) 避免除以零產生 inf
     safe_rev = df["revenue"].replace(0, float("nan"))
@@ -656,7 +724,7 @@ def analyze_financials(
     if df_income is None or df_income.empty:
         return None
 
-    metrics_df = _extract_key_metrics(df_income, quarterly=quarterly, is_tw=is_tw)
+    metrics_df = _extract_key_metrics(df_income, quarterly=quarterly)
     if metrics_df is None or len(metrics_df) < 2:
         return None
 
@@ -693,10 +761,7 @@ def render_financial_page() -> None:
                 value="2330",
                 max_chars=20,
                 key="fin_symbol",
-                help=(
-                    "台股輸入 4-6 位數字代號（如 2330），系統自動嘗試 .TW / .TWO。\n"
-                    "美股直接輸入英文代號（如 TSLA、AAPL）。"
-                ),
+                help="僅支援台灣股票。輸入 4-6 位數字代號（如 2330、6278）。",
             ).strip()
         with col_b:
             period = st.radio(
@@ -761,18 +826,24 @@ def render_financial_page() -> None:
         st.info(
             "請在上方輸入股票代號，點擊「查詢財報」。\n\n"
             "**支援範圍**\n"
-            "- 台灣上市（.TW）/ 上櫃（.TWO）股票\n"
-            "- 美股及其他 Yahoo Finance 收錄標的\n\n"
+            "- 台灣上市 / 上櫃股票（4-6 位數字代號，如 2330、6278）\n\n"
             "**資料說明**\n"
-            "- 資料來源：Yahoo Finance（透過 yfinance）\n"
-            "- 台股財報可能延遲 1-2 個季度\n"
-            "- 「—」表示 Yahoo Finance 未收錄該科目\n"
-            "- 台股單位：億元（新台幣）；美股單位：B / M（USD）"
+            "- 資料來源：FinMind API（TaiwanStockFinancialStatements）\n"
+            "- 財報可能延遲 1-4 週才更新\n"
+            "- 「—」表示 FinMind 未收錄該科目（僅損益表科目有資料）\n"
+            "- 台股單位：億元（新台幣）"
         )
         return
 
     if not raw_symbol:
         st.error("股票代號不得為空。")
+        return
+
+    if not _TW_CODE_RE.match(raw_symbol.strip().upper()):
+        st.warning(
+            f"**{raw_symbol}** 不是台股代號。\n\n"
+            "本功能僅支援台灣上市上櫃股票，請輸入 4-6 位數字代號（如 2330、6278）。"
+        )
         return
 
     with st.spinner(f"正在查詢 {raw_symbol} 財報…"):
@@ -781,7 +852,7 @@ def render_financial_page() -> None:
         except Exception as e:
             st.error(
                 f"查詢失敗：{e}\n\n"
-                "可能原因：網路問題、Yahoo Finance 暫時封鎖（HTTP 429），請稍後再試。"
+                "可能原因：網路問題、FinMind API 暫時異常，請稍後再試。"
             )
             return
 
@@ -794,8 +865,7 @@ def render_financial_page() -> None:
         st.warning(
             f"查無 **{resolved}** 的財報資料。\n\n"
             "可能原因：\n"
-            "- 台股代號錯誤（上市用 .TW，上櫃用 .TWO）\n"
-            "- Yahoo Finance 尚未收錄此標的\n"
+            "- 代號錯誤或 FinMind API 尚未收錄此標的\n"
             "- 目前為非交易時段，資料尚未更新\n"
             "- 請稍後重試或確認代號是否正確"
         )
@@ -813,7 +883,7 @@ def render_financial_page() -> None:
         with tab:
             raw_df = data[key]
             if raw_df is None:
-                st.info(f"**{label}** 資料目前無法取得（Yahoo Finance 未收錄或查詢逾時）。")
+                st.info(f"**{label}** 資料目前無法取得（FinMind API 未收錄或查詢逾時）。")
                 continue
 
             disp_df = _prepare_display_df(raw_df, is_tw=is_tw)

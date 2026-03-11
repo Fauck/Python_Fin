@@ -970,9 +970,9 @@ def render_single_stock_page() -> None:
         show_ma10 = ind_cols[1].checkbox("MA10",          value=True,  key="ss_ma10")
         show_ma20 = ind_cols[2].checkbox("MA20",          value=True,  key="ss_ma20")
         show_kd   = ind_cols[3].checkbox("KD",            value=True,  key="ss_kd")
-        show_bb   = ind_cols[4].checkbox("布林",          value=False, key="ss_bb")
-        show_rsi  = ind_cols[5].checkbox("RSI",           value=False, key="ss_rsi")
-        show_macd = ind_cols[6].checkbox("MACD",          value=False, key="ss_macd")
+        show_bb   = ind_cols[4].checkbox("布林",          value=True, key="ss_bb")
+        show_rsi  = ind_cols[5].checkbox("RSI",           value=True, key="ss_rsi")
+        show_macd = ind_cols[6].checkbox("MACD",          value=True, key="ss_macd")
 
         query_btn = st.button("查詢", type="primary", use_container_width=True)
 
