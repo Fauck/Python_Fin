@@ -884,7 +884,7 @@ def render_financial_page() -> None:
                 st.info(f"**{label}** 資料目前無法取得（FinMind API 未收錄或查詢逾時）。")
                 continue
 
-            disp_df = _prepare_display_df(raw_df, is_tw=is_tw)
+            disp_df = _prepare_display_df(raw_df, is_tw=True)
             if disp_df.empty:
                 st.info(f"**{label}** 回傳空資料。")
                 continue

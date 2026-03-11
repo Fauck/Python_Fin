@@ -226,6 +226,198 @@ def fetch_valuation_data(symbol: str, years: int = 5) -> Optional[Dict[str, Any]
 
 
 # ═════════════════════════════════════════════
+# 進階基本面指標（資料層）
+# ═════════════════════════════════════════════
+
+@st.cache_data(ttl=3600)
+def fetch_advanced_metrics(
+    symbol: str,
+    current_price: float,
+    current_eps: float,
+    current_pe: float,
+) -> Dict[str, Any]:
+    """
+    抓取並計算 8 個核心基本面與進階估值指標。
+
+    Returns
+    -------
+    dict：
+        eps_ttm   : float | None
+        pe_ratio  : float | None
+        roe       : float | None  （%）
+        op_margin : float | None  （%）
+        fcf_yi    : float | None  （億元）
+        pb_ratio  : float | None  （倍）
+        peg_ratio : float | None
+        ps_ratio  : float | None  （倍）
+    """
+    _eps_ok = current_eps and not pd.isna(float(current_eps)) and float(current_eps) > 0
+    _pe_ok  = current_pe  and not pd.isna(float(current_pe))  and float(current_pe)  > 0
+    result: Dict[str, Any] = {
+        "eps_ttm":    round(float(current_eps), 2) if _eps_ok else None,
+        "pe_ratio":   round(float(current_pe),  2) if _pe_ok  else None,
+        "roe":        None,
+        "op_margin":  None,
+        "fcf_yi":     None,
+        "pb_ratio":   None,
+        "peg_ratio":  None,
+        "ps_ratio":   None,
+    }
+
+    start_2yr = (datetime.today() - timedelta(days=730)).strftime("%Y-%m-%d")
+
+    # ── 1. TaiwanStockFinancialStatements ─────────────────────────
+    stmt_df: pd.DataFrame = pd.DataFrame()
+    try:
+        resp = requests.get(
+            _FINMIND_URL,
+            params={
+                "dataset":    "TaiwanStockFinancialStatements",
+                "data_id":    symbol,
+                "start_date": start_2yr,
+            },
+            timeout=30,
+        )
+        records = resp.json().get("data", [])
+        if records:
+            stmt_df = pd.DataFrame(records)
+            stmt_df["date"]  = pd.to_datetime(stmt_df["date"])
+            stmt_df["value"] = pd.to_numeric(stmt_df["value"], errors="coerce")
+    except Exception:
+        pass
+
+    if not stmt_df.empty:
+        def _ttm(candidates: List[str]) -> Optional[float]:
+            """近四季合計（TTM）。"""
+            for t in candidates:
+                rows = stmt_df[stmt_df["type"] == t].sort_values("date")
+                if len(rows) >= 4:
+                    s = rows.tail(4)["value"].sum()
+                    return None if pd.isna(s) else float(s)
+            return None
+
+        def _latest_val(candidates: List[str]) -> Optional[float]:
+            """最新一季值。"""
+            for t in candidates:
+                rows = stmt_df[stmt_df["type"] == t].sort_values("date")
+                if not rows.empty:
+                    v = rows.iloc[-1]["value"]
+                    return None if pd.isna(v) else float(v)
+            return None
+
+        rev_ttm    = _ttm(["Revenue", "RevenueFromContractsWithCustomers", "OperatingRevenue"])
+        opinc_ttm  = _ttm(["OperatingIncome", "ProfitFromOperations", "OperatingProfit"])
+        ni_ttm     = _ttm([
+            "NetIncomeAttributableToOwnersOfTheParent",
+            "ProfitLoss", "IncomeAfterTaxes", "NetIncomeLoss",
+        ])
+        equity_now = _latest_val([
+            "TotalEquityAttributableToOwnersOfParent",
+            "Equity", "StockholdersEquity", "TotalEquity",
+        ])
+
+        # EPS 序列（需 8 季以上才可算 YoY，用於 PEG）
+        eps_series: Optional[pd.Series] = None
+        for _et in ["EarningsPerShareBasic", "BasicEarningsLossPerShare", "EPS"]:
+            _rows = stmt_df[stmt_df["type"] == _et].sort_values("date")
+            if len(_rows) >= 4:
+                eps_series = _rows["value"].reset_index(drop=True)
+                break
+
+        # Operating Margin
+        if opinc_ttm is not None and rev_ttm and rev_ttm != 0:
+            result["op_margin"] = round(opinc_ttm / rev_ttm * 100, 2)
+
+        # ROE = TTM 淨利 / 最新股東權益
+        if ni_ttm is not None and equity_now and equity_now > 0:
+            result["roe"] = round(ni_ttm / equity_now * 100, 2)
+
+        # P/S = P/E × 淨利率（無需股本資料）
+        if (ni_ttm is not None and rev_ttm and rev_ttm != 0
+                and _pe_ok and ni_ttm > 0):
+            net_margin = ni_ttm / rev_ttm
+            if net_margin > 0:
+                result["ps_ratio"] = round(float(current_pe) * net_margin, 2)
+
+        # PEG = P/E / EPS YoY 成長率
+        if (eps_series is not None and len(eps_series) >= 8 and _pe_ok):
+            ttm_now  = float(eps_series.tail(4).sum())
+            ttm_prev = float(eps_series.tail(8).head(4).sum())
+            if ttm_prev > 0 and ttm_now > 0:
+                yoy_pct = (ttm_now - ttm_prev) / ttm_prev * 100
+                if yoy_pct > 0:
+                    result["peg_ratio"] = round(float(current_pe) / yoy_pct, 2)
+
+    # ── 2. TaiwanStockCashFlowsStatement ──────────────────────────
+    try:
+        resp = requests.get(
+            _FINMIND_URL,
+            params={
+                "dataset":    "TaiwanStockCashFlowsStatement",
+                "data_id":    symbol,
+                "start_date": start_2yr,
+            },
+            timeout=30,
+        )
+        records = resp.json().get("data", [])
+        if records:
+            cf_df = pd.DataFrame(records)
+            cf_df["date"]  = pd.to_datetime(cf_df["date"])
+            cf_df["value"] = pd.to_numeric(cf_df["value"], errors="coerce")
+
+            def _cf_latest(candidates: List[str]) -> Optional[float]:
+                for t in candidates:
+                    rows = cf_df[cf_df["type"] == t].sort_values("date")
+                    if not rows.empty:
+                        v = rows.iloc[-1]["value"]
+                        return None if pd.isna(v) else float(v)
+                return None
+
+            op_cf  = _cf_latest([
+                "CashFlowsFromOperatingActivities",
+                "NetCashProvidedByUsedInOperatingActivities",
+                "NetCashFromOperatingActivities",
+            ])
+            inv_cf = _cf_latest([
+                "CashFlowsFromInvestingActivities",
+                "NetCashProvidedByUsedInInvestingActivities",
+                "NetCashUsedInInvestingActivities",
+                "NetCashFromInvestingActivities",
+            ])
+            if op_cf is not None and inv_cf is not None:
+                # FinMind 台股現金流量表單位通常為千元（千 NTD）
+                # 1 億 = 1e5 千元
+                result["fcf_yi"] = round((op_cf + inv_cf) / 1e5, 2)
+    except Exception:
+        pass
+
+    # ── 3. TaiwanStockPER → 最新 PBR ──────────────────────────────
+    try:
+        resp = requests.get(
+            _FINMIND_URL,
+            params={
+                "dataset":    "TaiwanStockPER",
+                "data_id":    symbol,
+                "start_date": (datetime.today() - timedelta(days=30)).strftime("%Y-%m-%d"),
+            },
+            timeout=15,
+        )
+        records = resp.json().get("data", [])
+        if records:
+            per_df = pd.DataFrame(records)
+            per_df["date"] = pd.to_datetime(per_df["date"])
+            per_df = per_df.sort_values("date")
+            if "PBR" in per_df.columns:
+                pbr_s = pd.to_numeric(per_df["PBR"], errors="coerce").dropna()
+                if not pbr_s.empty:
+                    result["pb_ratio"] = round(float(pbr_s.iloc[-1]), 2)
+    except Exception:
+        pass
+
+    return result
+
+
+# ═════════════════════════════════════════════
 # 計算層：P/E / P/B / 殖利率 河流資料
 # ═════════════════════════════════════════════
 
@@ -581,6 +773,66 @@ def _render_zone_cards(
 """, unsafe_allow_html=True)
 
 
+def _render_advanced_metrics(
+    symbol: str,
+    current_price: float,
+    current_eps: float,
+    current_pe: float,
+) -> None:
+    """渲染 8 個核心基本面與進階估值指標體檢卡片（兩排各 4 格）。"""
+    st.markdown("---")
+    st.markdown("##### 💎 核心基本面與進階估值體檢")
+
+    with st.spinner("正在抓取進階基本面資料…"):
+        m = fetch_advanced_metrics(
+            symbol        = symbol,
+            current_price = current_price,
+            current_eps   = current_eps,
+            current_pe    = current_pe,
+        )
+
+    def _fmt(v: Any, suffix: str = "", decimals: int = 2, na: str = "無資料") -> str:
+        if v is None:
+            return na
+        try:
+            f = float(v)
+            if pd.isna(f) or np.isinf(f):
+                return na
+            return f"{f:.{decimals}f}{suffix}"
+        except Exception:
+            return na
+
+    def _card(col: Any, title: str, value_str: str, caption_txt: str) -> None:
+        is_na     = value_str in ("無資料", "不適用")
+        txt_color = "#9E9E9E" if is_na else "#212121"
+        col.markdown(
+            f"""<div style="border:1px solid #E0E0E0;border-radius:12px;
+                padding:18px 10px 12px;background:#FAFAFA;
+                text-align:center;min-height:95px;">
+  <div style="font-size:11px;color:#888;font-weight:600;
+              letter-spacing:0.5px;margin-bottom:6px;">{title}</div>
+  <div style="font-size:22px;font-weight:800;color:{txt_color};
+              line-height:1.2;">{value_str}</div>
+</div>""",
+            unsafe_allow_html=True,
+        )
+        col.caption(caption_txt)
+
+    # ── 第一排：盈利能力 ──────────────────────────────────────────
+    r1 = st.columns(4)
+    _card(r1[0], "EPS (TTM)",   _fmt(m["eps_ttm"],  " 元"),  "近四季累積盈餘")
+    _card(r1[1], "P/E Ratio",   _fmt(m["pe_ratio"], " 倍"),  "投入回本年數")
+    _card(r1[2], "ROE",         _fmt(m["roe"],       "%"),    "＞ 15% 屬優秀")
+    _card(r1[3], "營益率",      _fmt(m["op_margin"], "%"),    "反映本業獲利能力")
+
+    # ── 第二排：估值與現金流 ──────────────────────────────────────
+    r2 = st.columns(4)
+    _card(r2[0], "自由現金流 (FCF)", _fmt(m["fcf_yi"],   " 億"),           "落袋為安的真現金")
+    _card(r2[1], "P/B Ratio",        _fmt(m["pb_ratio"], " 倍"),           "適合循環／金融股")
+    _card(r2[2], "PEG Ratio",        _fmt(m["peg_ratio"], na="不適用"),     "< 1 代表成長股被低估")
+    _card(r2[3], "P/S Ratio",        _fmt(m["ps_ratio"], " 倍"),           "適用高成長未獲利新創")
+
+
 def _render_results(cache: Dict[str, Any]) -> None:
     """從 session_state cache 渲染所有估值結果（圖表、卡片、統計）。"""
     data          = cache["data"]
@@ -647,6 +899,16 @@ def _render_results(cache: Dict[str, Any]) -> None:
         f"當前 {band_data['ratio_name'].split('（')[0]}："
         f"**{band_data['current_ratio']} {band_data['unit']}**"
         f"　｜　統計區間：近 {years} 年（P10 ~ P90，去除首尾 10% 極端值）"
+    )
+
+    # ── 進階基本面與估值體檢 ──────────────────────────────────────
+    _eps = _to_float(data.get("current_eps")) or 0.0
+    _pe  = round(current_price / _eps, 2) if _eps > 0 else 0.0
+    _render_advanced_metrics(
+        symbol        = data["symbol_full"],
+        current_price = current_price,
+        current_eps   = _eps,
+        current_pe    = _pe,
     )
 
 
