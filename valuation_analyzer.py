@@ -111,7 +111,7 @@ def _fetch_per_finmind(symbol: str, years: int) -> pd.DataFrame:
         df = pd.DataFrame(records)
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date")
-        for col in ["PE_ratio", "PB_ratio", "dividend_yield"]:
+        for col in ["PER", "PBR", "dividend_yield"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
@@ -189,16 +189,16 @@ def fetch_valuation_data(symbol: str, years: int = 5) -> Optional[Dict[str, Any]
         # 對齊每日交易日索引，ffill 填補假日缺漏
         aligned_per = per_df.reindex(price_df.index).ffill()
 
-        if "PE_ratio" in aligned_per.columns:
-            pe_valid = aligned_per["PE_ratio"] > 0
+        if "PER" in aligned_per.columns:
+            pe_valid = aligned_per["PER"] > 0
             eps_daily[pe_valid] = (
-                price_df["close"][pe_valid] / aligned_per["PE_ratio"][pe_valid]
+                price_df["close"][pe_valid] / aligned_per["PER"][pe_valid]
             )
 
-        if "PB_ratio" in aligned_per.columns:
-            pb_valid = aligned_per["PB_ratio"] > 0
+        if "PBR" in aligned_per.columns:
+            pb_valid = aligned_per["PBR"] > 0
             bvps_daily[pb_valid] = (
-                price_df["close"][pb_valid] / aligned_per["PB_ratio"][pb_valid]
+                price_df["close"][pb_valid] / aligned_per["PBR"][pb_valid]
             )
 
         if "dividend_yield" in aligned_per.columns:
