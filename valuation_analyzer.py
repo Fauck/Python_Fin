@@ -7,9 +7,7 @@
 - 100% 使用者主動觸發（無任何排程或背景任務）
 - 資料來源（台股限定）：
     * 每日收盤價      → Fugle historical candles（fetch_stock_candles）
-    * 配息記錄        → FinMind TaiwanStockDividendResult
-    * 季度 EPS        → FinMind TaiwanStockFinancialStatements（type="EPS"）→ TTM
-    * 季度 BVPS       → FinMind TaiwanStockFinancialStatements（type="每股參考淨值" 等）
+    * EPS / BVPS / 配息 → FinMind TaiwanStockPER（每日官方估值指標）反推
 - TTM (Trailing Twelve Months)：近四季滾動 EPS，河流圖呈平滑波浪
 - @st.cache_data(ttl=3600) 快取避免重複呼叫
 - st.session_state 保存查詢結果，避免圖表因互動消失
@@ -28,8 +26,7 @@ import streamlit as st
 from utils import fetch_stock_candles
 
 # ── FinMind API 設定
-_FINMIND_URL     = "https://api.finmindtrade.com/api/v4/data"
-_FINMIND_DATASET = "TaiwanStockFinancialStatements"
+_FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
 
 # ── 台股代號識別（4~6 位純數字）
@@ -69,68 +66,6 @@ def _to_float(v: Any) -> Optional[float]:
         return None
 
 
-def _find_row(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
-    """在 DataFrame index 中尋找目標科目（先精確比對再模糊比對）。"""
-    for c in candidates:
-        for idx in df.index:
-            if c.lower() == str(idx).lower():
-                return df.loc[idx]
-    for c in candidates:
-        for idx in df.index:
-            if c.lower() in str(idx).lower():
-                return df.loc[idx]
-    return None
-
-
-def _row_to_series(row: pd.Series) -> pd.Series:
-    """
-    將財報 DataFrame 的一行（columns = Timestamps）
-    轉為日期升冪索引的 pd.Series[float]。
-    """
-    data: Dict[pd.Timestamp, float] = {}
-    for col, val in row.items():
-        try:
-            dt = pd.Timestamp(str(col)).tz_localize(None)
-            v  = _to_float(val)
-            if v is not None:
-                data[dt] = v
-        except Exception:
-            pass
-    return pd.Series(data).sort_index()
-
-
-def _align_to_daily(
-    annual_series: pd.Series,
-    price_df: pd.DataFrame,
-) -> pd.Series:
-    """
-    將基本面資料（年度或季度，索引為財報日期）前向填充至每日交易日索引。
-    price_df 必須已有 DatetimeIndex。
-    """
-    combined = annual_series.reindex(
-        annual_series.index.union(price_df.index)
-    ).sort_index().ffill()
-    return combined.reindex(price_df.index)
-
-
-def _compute_ttm_quarterly(
-    q_series: pd.Series,
-    price_df: pd.DataFrame,
-) -> pd.Series:
-    """
-    將季度 EPS Series（升冪日期索引）轉為 TTM（近四季滾動加總），
-    再前向填充至每日。
-
-    TTM EPS = 最近四個季度 EPS 之和，每當新季報發布即平滑更新。
-    若有效季度 < 4，回傳空 Series（上層函式視為資料不足）。
-    """
-    q = q_series.sort_index().dropna()
-    if len(q) < 4:
-        return pd.Series(dtype=float, index=price_df.index)
-    ttm = q.rolling(4, min_periods=4).sum().dropna()
-    if ttm.empty:
-        return pd.Series(dtype=float, index=price_df.index)
-    return _align_to_daily(ttm, price_df)
 
 
 def _five_equal_levels(
@@ -150,172 +85,38 @@ def _five_equal_levels(
 
 
 # ═════════════════════════════════════════════
-# FinMind 配息資料
+# FinMind 官方每日估值指標
 # ═════════════════════════════════════════════
 
-def _fetch_dividends_finmind(symbol: str, years: int) -> Optional[pd.Series]:
+def _fetch_per_finmind(symbol: str, years: int) -> pd.DataFrame:
     """
-    透過 FinMind TaiwanStockDividendResult 取得台股歷史現金配息，
-    回傳以年度結尾日（YYYY-12-31）為索引的年度現金配息 Series。
-    失敗 / 無配息記錄時回傳 None。
+    取得 FinMind TaiwanStockPER 每日官方估值指標（PE / PB / 殖利率）。
 
-    FinMind 現金股利由兩欄組成：
-        CashEarningsDistribution       — 盈餘配息
-        CashStatutorySurplusDistribution — 公積配息
-    """
-    start_date = (datetime.today() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
-    try:
-        resp = requests.get(
-            _FINMIND_URL,
-            params={"dataset": "TaiwanStockDividendResult", "data_id": symbol, "start_date": start_date},
-            timeout=30,
-        )
-        records = resp.json().get("data", [])
-        if not records:
-            return None
-
-        df = pd.DataFrame(records)
-        df["date"] = pd.to_datetime(df.get("date", pd.Series(dtype=str)), errors="coerce")
-
-        # 合併兩個現金股利欄位
-        df["cash_dividend"] = 0.0
-        for col in ["CashEarningsDistribution", "CashStatutorySurplusDistribution"]:
-            if col in df.columns:
-                df["cash_dividend"] += pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-        df = df.dropna(subset=["date"])
-        df = df[df["cash_dividend"] > 0]
-        if df.empty:
-            return None
-
-        # 依年加總（同一年可能多次配息）
-        annual = df.groupby(pd.DatetimeIndex(df["date"]).year)["cash_dividend"].sum()
-
-        # 轉換為年底日期索引
-        idx = pd.DatetimeIndex([f"{y}-12-31" for y in annual.index])
-        return pd.Series(annual.values, index=idx, dtype=float).sort_index()
-
-    except Exception:
-        return None
-
-
-def _fetch_finmind_quarterly(symbol: str, years: int = 3) -> pd.DataFrame:
-    """
-    呼叫 FinMind TaiwanStockFinancialStatements，回傳近 years 年季報 long-format DataFrame。
-
-    欄位：date（Timestamp）、type（科目名）、value（float）
+    回傳 DataFrame，index 為 date（DatetimeIndex），欄位：
+        PE_ratio       — 本益比
+        PB_ratio       — 股價淨值比
+        dividend_yield — 現金殖利率（%）
     失敗 / 無資料時回傳空 DataFrame。
     """
-    start_date = (
-        datetime.today() - timedelta(days=years * 365)
-    ).strftime("%Y-%m-%d")
+    start_date = (datetime.today() - timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     try:
         resp = requests.get(
             _FINMIND_URL,
-            params={
-                "dataset":    _FINMIND_DATASET,
-                "data_id":    symbol,
-                "start_date": start_date,
-            },
+            params={"dataset": "TaiwanStockPER", "data_id": symbol, "start_date": start_date},
             timeout=30,
         )
-        resp.raise_for_status()
         records = resp.json().get("data", [])
         if not records:
             return pd.DataFrame()
-
         df = pd.DataFrame(records)
-        df["value"] = pd.to_numeric(df.get("value", pd.Series(dtype=float)), errors="coerce")
-        df["date"]  = pd.to_datetime(df.get("date",  pd.Series(dtype=str)),  errors="coerce")
-        return df.dropna(subset=["date", "value"])
-
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+        for col in ["PE_ratio", "PB_ratio", "dividend_yield"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
     except Exception:
         return pd.DataFrame()
-
-
-def _fetch_eps_finmind(symbol: str, price_df: pd.DataFrame, years: int = 3) -> pd.Series:
-    """
-    透過 FinMind TaiwanStockFinancialStatements（type=="EPS"）取得季度 EPS，
-    計算 TTM 四季滾動 EPS Series 並對齊每日。
-
-    注意：
-    - API 無資料或解析失敗 → 回傳空 Series，絕不誤判為 EPS ≤ 0
-    - TTM = 近四季 EPS 加總（需至少 4 季資料，否則回傳空 Series）
-    """
-    empty = pd.Series(dtype=float, index=price_df.index)
-    try:
-        df_long = _fetch_finmind_quarterly(symbol, years=years)
-        if df_long.empty:
-            return empty  # API 無資料，非 EPS <= 0
-
-        eps_df = df_long[df_long["type"] == "EPS"].copy()
-        if eps_df.empty:
-            return empty  # 此標的無 EPS 科目
-
-        eps_df = eps_df.dropna(subset=["date", "value"])
-        if eps_df.empty:
-            return empty
-
-        q_series = pd.Series(
-            eps_df["value"].values,
-            index=pd.DatetimeIndex(eps_df["date"]).tz_localize(None),
-        ).sort_index()
-
-        return _compute_ttm_quarterly(q_series, price_df)
-
-    except Exception:
-        return empty  # 任何例外 → 安全回傳空 Series
-
-
-def _fetch_bvps_finmind(symbol: str, price_df: pd.DataFrame, years: int = 3) -> pd.Series:
-    """
-    透過 FinMind TaiwanStockBalanceSheet 取得每股淨值（BVPS），
-    前向填充至每日。
-
-    搜尋順序（type 欄位精確比對）：
-        每股參考淨值 → 每股淨值 → BookValuePerShare → BVPS → 每股帳面價值
-    失敗 / 無資料 → 回傳空 Series。
-    """
-    empty = pd.Series(dtype=float, index=price_df.index)
-    _BVPS_TYPES = ["每股參考淨值", "每股淨值", "BookValuePerShare", "BVPS", "每股帳面價值"]
-    try:
-        start_date = (datetime.today() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
-        resp = requests.get(
-            _FINMIND_URL,
-            params={"dataset": "TaiwanStockBalanceSheet", "data_id": symbol, "start_date": start_date},
-            timeout=30,
-        )
-        records = resp.json().get("data", [])
-        if not records:
-            return empty
-
-        df_long = pd.DataFrame(records)
-        df_long["value"] = pd.to_numeric(df_long.get("value", pd.Series(dtype=float)), errors="coerce")
-        df_long["date"]  = pd.to_datetime(df_long.get("date",  pd.Series(dtype=str)),  errors="coerce")
-
-        bvps_df = pd.DataFrame()
-        for t in _BVPS_TYPES:
-            filtered = df_long[df_long["type"] == t]
-            if not filtered.empty:
-                bvps_df = filtered.copy()
-                break
-
-        if bvps_df.empty:
-            return empty
-
-        bvps_df = bvps_df.dropna(subset=["date", "value"])
-        bvps_df = bvps_df[bvps_df["value"] > 0]
-        if bvps_df.empty:
-            return empty
-
-        q_series = pd.Series(
-            bvps_df["value"].values,
-            index=pd.DatetimeIndex(bvps_df["date"]).tz_localize(None),
-        ).sort_index()
-        return _align_to_daily(q_series, price_df)
-
-    except Exception:
-        return empty
 
 
 # ═════════════════════════════════════════════
@@ -323,43 +124,41 @@ def _fetch_bvps_finmind(symbol: str, price_df: pd.DataFrame, years: int = 3) -> 
 # ═════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
-def fetch_valuation_data(
-    symbol: str,
-    years: int = 5,
-) -> Optional[Dict[str, Any]]:
+def fetch_valuation_data(symbol: str, years: int = 5) -> Optional[Dict[str, Any]]:
     """
-    取得估值分析所需歷史資料（Fugle API，台股限定）。
+    取得估值分析所需歷史資料（台股限定）。
 
     資料來源策略
     -----------
-    - 每日收盤價    : Fugle historical candles（fetch_stock_candles）
-    - 季度 EPS      : Fugle historical.eps() → TTM rolling 4Q
-    - 季度 BVPS     : Fugle historical.financials(balance, quarter) → 每股淨值欄
-    - 年度配息      : Fugle corporate_actions.dividends()
+    - 每日收盤價 : Fugle historical candles（fetch_stock_candles）
+    - EPS / BVPS / 配息 : FinMind TaiwanStockPER（每日官方估值指標）反推
+
+    反推公式
+    --------
+    EPS   = Price / PE_ratio
+    BVPS  = Price / PB_ratio
+    配息  = Price × (dividend_yield / 100)
 
     Returns
     -------
     None（非台股代號 / 資料抓取失敗）或 dict：
         symbol_full   : str
         price_df      : DataFrame (DatetimeIndex, col="close")
-        eps_daily     : Series  — TTM EPS daily
-        bvps_daily    : Series  — 季度 BVPS daily
-        div_annual    : Series  — 年度配息
-        div_daily     : Series  — 年度配息前向填充至每日
+        eps_daily     : Series  — EPS（由 PE_ratio 反推），每日
+        bvps_daily    : Series  — BVPS（由 PB_ratio 反推），每日
+        div_annual    : Series  — 與 div_daily 相同（相容舊介面）
+        div_daily     : Series  — 配息（由 dividend_yield 反推），每日
         current_price : float
         current_eps   : float | None
         current_bvps  : float | None
         current_div   : float | None
     """
-    raw   = symbol.strip().upper()
-    is_tw = bool(_TW_CODE_RE.match(raw))
-
-    # 台股限定：非台股代號直接回傳 None
-    if not is_tw:
+    raw = symbol.strip().upper()
+    if not _TW_CODE_RE.match(raw):
         return None
 
     # ── 1. 每日收盤價（Fugle candles）────────────────────────────
-    limit     = years * 300   # ~250 交易日/年 + 緩衝
+    limit     = years * 300
     date_to   = datetime.today().strftime("%Y-%m-%d")
     date_from = (datetime.today() - timedelta(days=years * 365 + 60)).strftime("%Y-%m-%d")
 
@@ -380,40 +179,44 @@ def fetch_valuation_data(
     if current_price is None:
         return None
 
-    # ── 2. 季度 EPS → TTM（FinMind EPS API）────────────────────────
-    eps_daily: pd.Series = _fetch_eps_finmind(raw, price_df, years=years)
-    current_eps = (
-        _to_float(eps_daily.dropna().iloc[-1])
-        if not eps_daily.dropna().empty else None
-    )
+    # ── 2. 透過 TaiwanStockPER 反推三大基本面數據 ─────────────────
+    per_df = _fetch_per_finmind(raw, years)
+    eps_daily:  pd.Series = pd.Series(dtype=float, index=price_df.index)
+    bvps_daily: pd.Series = pd.Series(dtype=float, index=price_df.index)
+    div_daily:  pd.Series = pd.Series(dtype=float, index=price_df.index)
 
-    # ── 3. BVPS（FinMind balance sheet quarterly）────────────────
-    bvps_daily: pd.Series = _fetch_bvps_finmind(raw, price_df, years=years)
-    current_bvps = (
-        _to_float(bvps_daily.dropna().iloc[-1])
-        if not bvps_daily.dropna().empty else None
-    )
+    if not per_df.empty:
+        # 對齊每日交易日索引，ffill 填補假日缺漏
+        aligned_per = per_df.reindex(price_df.index).ffill()
 
-    # ── 4. 年度配息（FinMind TaiwanStockDividendResult）──────────
-    div_annual: pd.Series = pd.Series(dtype=float)
-    finmind_divs = _fetch_dividends_finmind(raw, years)
-    if finmind_divs is not None and not finmind_divs.empty:
-        div_annual = finmind_divs
+        if "PE_ratio" in aligned_per.columns:
+            pe_valid = aligned_per["PE_ratio"] > 0
+            eps_daily[pe_valid] = (
+                price_df["close"][pe_valid] / aligned_per["PE_ratio"][pe_valid]
+            )
 
-    div_daily: pd.Series = pd.Series(dtype=float, index=price_df.index)
-    if not div_annual.empty:
-        div_daily = _align_to_daily(div_annual, price_df)
+        if "PB_ratio" in aligned_per.columns:
+            pb_valid = aligned_per["PB_ratio"] > 0
+            bvps_daily[pb_valid] = (
+                price_df["close"][pb_valid] / aligned_per["PB_ratio"][pb_valid]
+            )
 
-    current_div = (
-        _to_float(div_annual.iloc[-1]) if not div_annual.empty else None
-    )
+        if "dividend_yield" in aligned_per.columns:
+            dy_valid = aligned_per["dividend_yield"] > 0
+            div_daily[dy_valid] = (
+                price_df["close"][dy_valid] * (aligned_per["dividend_yield"][dy_valid] / 100.0)
+            )
+
+    current_eps  = _to_float(eps_daily.dropna().iloc[-1])  if not eps_daily.dropna().empty  else None
+    current_bvps = _to_float(bvps_daily.dropna().iloc[-1]) if not bvps_daily.dropna().empty else None
+    current_div  = _to_float(div_daily.dropna().iloc[-1])  if not div_daily.dropna().empty  else None
 
     return {
         "symbol_full":   raw,
         "price_df":      price_df,
-        "eps_daily":     eps_daily,    # TTM EPS，已對齊每日
-        "bvps_daily":    bvps_daily,   # 季度 BVPS，已對齊每日
-        "div_annual":    div_annual,
+        "eps_daily":     eps_daily,
+        "bvps_daily":    bvps_daily,
+        "div_annual":    div_daily,   # 相容舊介面
         "div_daily":     div_daily,
         "current_price": current_price,
         "current_eps":   current_eps,
