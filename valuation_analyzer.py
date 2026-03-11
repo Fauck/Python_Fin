@@ -23,7 +23,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from utils import fetch_stock_candles
+from utils import fetch_stock_candles, resolve_stock_input
 
 # ── FinMind API 設定
 _FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
@@ -662,11 +662,11 @@ def render_valuation_page() -> None:
         col_a, col_b = st.columns(2)
         with col_a:
             symbol = st.text_input(
-                "股票代號",
+                "股票代號/名稱",
                 value="2330",
                 max_chars=20,
                 key="val_symbol",
-                help="僅支援台灣股票。輸入 4-6 位數字代號（如 2330、6278）。",
+                help="支援台灣股票。可輸入數字代號 (如 2330) 或中文股名 (如 台積電)。",
             ).strip()
             years: int = st.select_slider(
                 "歷史年數",
@@ -737,72 +737,76 @@ def render_valuation_page() -> None:
     # ── 按鈕按下 → 計算並存入 session_state ───────────────────
     if query_btn:
         if not symbol:
-            st.error("股票代號不得為空。")
+            st.error("請輸入股票代號或名稱。")
             st.session_state["val_cache"] = None
 
         else:
-            with st.spinner(f"正在取得 {symbol} 歷史資料（{years} 年）…"):
-                try:
-                    data = fetch_valuation_data(symbol=symbol, years=years)
-                except Exception as e:
-                    st.error(f"資料抓取失敗：{e}")
-                    st.session_state["val_cache"] = None
-                    data = None
-
-            if data is None:
-                st.warning(
-                    f"查無 **{symbol}** 的歷史資料。\n\n"
-                    "可能原因：\n"
-                    "- 非台股代號（本功能僅支援台灣股票，請輸入 4-6 位數字代號）\n"
-                    "- 代號錯誤或 Fugle API 尚未收錄此標的\n"
-                    "- 目前網路連線不穩定，請稍後再試"
-                )
+            resolved_code, display_name = resolve_stock_input(symbol)
+            if not resolved_code:
+                st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
                 st.session_state["val_cache"] = None
-
             else:
-                method_key = (method or "")[:1]
-                _HINTS = {
-                    "📊": (
-                        f"**{data['symbol_full']}** 的本益比河流圖資料不足。\n\n"
+                with st.spinner(f"正在取得 {display_name} 歷史資料（{years} 年）…"):
+                    try:
+                        data = fetch_valuation_data(symbol=resolved_code, years=years)
+                    except Exception as e:
+                        st.error(f"資料抓取失敗：{e}")
+                        st.session_state["val_cache"] = None
+                        data = None
+
+                if data is None:
+                    st.warning(
+                        f"查無 **{display_name}** 的歷史資料。\n\n"
                         "可能原因：\n"
-                        "- FinMind API 尚未收錄此標的的 EPS 季報資料\n"
-                        "- 近四季 EPS 有效資料不足（TTM 需至少 4 季）\n\n"
-                        "建議改用「淨值比河流圖」或「殖利率通道」。"
-                    ),
-                    "📚": (
-                        f"**{data['symbol_full']}** 的淨值比河流圖資料不足。\n\n"
-                        "可能原因：FinMind API 尚未收錄每股淨值季報資料。\n\n"
-                        "建議改用「本益比」或確認代號是否正確。"
-                    ),
-                    "💰": (
-                        f"**{data['symbol_full']}** 近期無配息記錄，"
-                        "無法建立殖利率通道。\n\n"
-                        "建議改用「本益比」或「淨值比」河流圖。"
-                    ),
-                }
-
-                with st.spinner("正在計算估值帶線…"):
-                    if method_key == "📊":
-                        band_data = compute_pe_bands(data, custom_levels=custom_levels)
-                    elif method_key == "📚":
-                        band_data = compute_pb_bands(data, custom_levels=custom_levels)
-                    else:
-                        band_data = compute_yield_bands(data, custom_levels=custom_levels)
-
-                if band_data is None:
-                    st.warning(_HINTS.get(method_key, "資料不足，無法計算。"))
-                    st.session_state["val_cache"] = None
-                else:
-                    eval_result = evaluate_current_price(
-                        data["current_price"], band_data["current_bands"]
+                        "- 代號錯誤或 Fugle API 尚未收錄此標的\n"
+                        "- 目前網路連線不穩定，請稍後再試"
                     )
-                    st.session_state["val_cache"] = {
-                        "data":        data,
-                        "band_data":   band_data,
-                        "eval_result": eval_result,
-                        "years":       years,
-                        "is_custom":   use_custom,
+                    st.session_state["val_cache"] = None
+
+                else:
+                    method_key = (method or "")[:1]
+                    _HINTS = {
+                        "📊": (
+                            f"**{display_name}** 的本益比河流圖資料不足。\n\n"
+                            "可能原因：\n"
+                            "- FinMind API 尚未收錄此標的的 EPS 季報資料\n"
+                            "- 近四季 EPS 有效資料不足（TTM 需至少 4 季）\n\n"
+                            "建議改用「淨值比河流圖」或「殖利率通道」。"
+                        ),
+                        "📚": (
+                            f"**{display_name}** 的淨值比河流圖資料不足。\n\n"
+                            "可能原因：FinMind API 尚未收錄每股淨值季報資料。\n\n"
+                            "建議改用「本益比」或確認代號是否正確。"
+                        ),
+                        "💰": (
+                            f"**{display_name}** 近期無配息記錄，"
+                            "無法建立殖利率通道。\n\n"
+                            "建議改用「本益比」或「淨值比」河流圖。"
+                        ),
                     }
+
+                    with st.spinner("正在計算估值帶線…"):
+                        if method_key == "📊":
+                            band_data = compute_pe_bands(data, custom_levels=custom_levels)
+                        elif method_key == "📚":
+                            band_data = compute_pb_bands(data, custom_levels=custom_levels)
+                        else:
+                            band_data = compute_yield_bands(data, custom_levels=custom_levels)
+
+                    if band_data is None:
+                        st.warning(_HINTS.get(method_key, "資料不足，無法計算。"))
+                        st.session_state["val_cache"] = None
+                    else:
+                        eval_result = evaluate_current_price(
+                            data["current_price"], band_data["current_bands"]
+                        )
+                        st.session_state["val_cache"] = {
+                            "data":        data,
+                            "band_data":   band_data,
+                            "eval_result": eval_result,
+                            "years":       years,
+                            "is_custom":   use_custom,
+                        }
 
     # ── 從 session_state 渲染（即使沒有按按鈕也能保留圖表）───────
     cache = st.session_state.get("val_cache")

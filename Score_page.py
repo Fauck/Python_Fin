@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from chips_analyzer import fetch_dividends
-from utils import fetch_stock_candles
+from utils import fetch_stock_candles, resolve_stock_input
 
 
 # ═════════════════════════════════════════════
@@ -411,9 +411,9 @@ def render_score_page() -> None:
     """個股綜合評分頁面（雙模式 100 分制買進指標）。"""
     with st.expander("🔍 查詢條件設定與操作", expanded=True):
         symbol = st.text_input(
-            "股票代號", value="2330", max_chars=10,
+            "股票代號/名稱", value="2330", max_chars=20,
             key="score_page_symbol",
-            help="輸入台灣股票代號，例如 2330（台積電）",
+            help="支援台灣股票。可輸入數字代號 (如 2330) 或中文股名 (如 台積電)。",
         ).strip()
 
         mode = st.radio(
@@ -445,13 +445,19 @@ def render_score_page() -> None:
         return
 
     if not symbol:
-        st.error("股票代號不得為空，請重新輸入。")
+        st.error("請輸入股票代號或名稱。")
         return
+
+    resolved_code, display_name = resolve_stock_input(symbol)
+    if not resolved_code:
+        st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
+        return
+    symbol = display_name
 
     with st.spinner(f"正在分析 {symbol}…"):
         try:
             df_full = fetch_stock_candles(
-                symbol=symbol,
+                symbol=resolved_code,
                 limit=_SCORE_FETCH_LIMIT,
                 fields="open,high,low,close,volume",
             )
@@ -470,7 +476,7 @@ def render_score_page() -> None:
     yield_bonus = 0
     if mode == MODE_B and not df_full.empty:
         try:
-            div_data = fetch_dividends(symbol)
+            div_data = fetch_dividends(resolved_code)
             if div_data is not None:
                 avg_cash      = div_data["avg_cash_3yr"]
                 current_close = float(df_full["close"].iloc[-1])

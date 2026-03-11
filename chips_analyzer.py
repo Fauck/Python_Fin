@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from utils import fetch_stock_candles, get_fugle_client
+from utils import fetch_stock_candles, get_fugle_client, resolve_stock_input
 
 
 # ═════════════════════════════════════════════
@@ -312,9 +312,9 @@ def render_chips_page() -> None:
         col_a, col_b = st.columns(2)
         with col_a:
             symbol = st.text_input(
-                "股票代號", value="2330", max_chars=10,
+                "股票代號/名稱", value="2330", max_chars=20,
                 key="chips_page_symbol",
-                help="輸入台灣股票代號，例如 2330（台積電）",
+                help="支援台灣股票。可輸入數字代號 (如 2330) 或中文股名 (如 台積電)。",
             ).strip()
         with col_b:
             days: int = st.selectbox(  # type: ignore[assignment]
@@ -341,12 +341,18 @@ def render_chips_page() -> None:
         return
 
     if not symbol:
-        st.error("股票代號不得為空，請重新輸入。")
+        st.error("請輸入股票代號或名稱。")
         return
+
+    resolved_code, display_name = resolve_stock_input(symbol)
+    if not resolved_code:
+        st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
+        return
+    symbol = display_name
 
     with st.spinner(f"正在取得 {symbol} 資料…"):
         df_candle = fetch_stock_candles(
-            symbol=symbol,
+            symbol=resolved_code,
             limit=days,
             fields="open,high,low,close,volume",
         )
@@ -355,9 +361,9 @@ def render_chips_page() -> None:
         if not df_candle.empty and "date" in df_candle.columns:
             candle_start = pd.Timestamp(str(df_candle.iloc[0]["date"])).strftime("%Y-%m-%d")
         df_insti = fetch_institutional_trading(
-            symbol=symbol, days=days, start_date=candle_start
+            symbol=resolved_code, days=days, start_date=candle_start
         )
-        div_data = fetch_dividends(symbol=symbol)
+        div_data = fetch_dividends(symbol=resolved_code)
 
     if df_candle.empty:
         st.warning(f"查無 **{symbol}** 的 K 線資料，請確認代號是否正確。")

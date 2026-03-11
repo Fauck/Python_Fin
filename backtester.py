@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils import fetch_stock_candles, compute_atr
+from utils import fetch_stock_candles, compute_atr, resolve_stock_input
 from Screener_page import (
     check_consolidation_breakout,
     check_bullish_ma_alignment,
@@ -314,9 +314,9 @@ def render_backtest_page() -> None:
         col_a, col_b = st.columns(2)
         with col_a:
             symbol = st.text_input(
-                "股票代號", value="2330", max_chars=10,
+                "股票代號/名稱", value="2330", max_chars=20,
                 key="bt_symbol",
-                help="輸入台灣股票代號，例如 2330（台積電）",
+                help="支援台灣股票。可輸入數字代號 (如 2330) 或中文股名 (如 台積電)。",
             ).strip()
             strategy_names = list(_build_strategy_registry().keys())
             strategy_name  = st.selectbox(
@@ -394,13 +394,19 @@ def render_backtest_page() -> None:
         return
 
     if not symbol:
-        st.error("股票代號不得為空。")
+        st.error("請輸入股票代號或名稱。")
         return
+
+    resolved_code, display_name = resolve_stock_input(symbol)
+    if not resolved_code:
+        st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
+        return
+    symbol = display_name
 
     with st.spinner(f"正在執行 {symbol} × {strategy_name} 回測…"):
         try:
             result = _cached_backtest(
-                symbol=symbol,
+                symbol=resolved_code,
                 fetch_limit=fetch_limit,
                 strategy_name=str(strategy_name),
                 take_profit_pct=take_profit_pct,

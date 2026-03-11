@@ -24,6 +24,7 @@ from plotly.subplots import make_subplots
 
 from financial_translations import METRICS_COL_ZH as _METRICS_COL_ZH
 from financial_translations import STMT_INDEX_ZH as _STMT_INDEX_ZH
+from utils import resolve_stock_input
 
 
 # ── 台股純數字代號識別（4~6 位）
@@ -757,11 +758,11 @@ def render_financial_page() -> None:
         col_a, col_b = st.columns(2)
         with col_a:
             raw_symbol = st.text_input(
-                "股票代號",
+                "股票代號/名稱",
                 value="2330",
                 max_chars=20,
                 key="fin_symbol",
-                help="僅支援台灣股票。輸入 4-6 位數字代號（如 2330、6278）。",
+                help="支援台灣股票。可輸入數字代號 (如 2330) 或中文股名 (如 台積電)。",
             ).strip()
         with col_b:
             period = st.radio(
@@ -836,19 +837,17 @@ def render_financial_page() -> None:
         return
 
     if not raw_symbol:
-        st.error("股票代號不得為空。")
+        st.error("請輸入股票代號或名稱。")
         return
 
-    if not _TW_CODE_RE.match(raw_symbol.strip().upper()):
-        st.warning(
-            f"**{raw_symbol}** 不是台股代號。\n\n"
-            "本功能僅支援台灣上市上櫃股票，請輸入 4-6 位數字代號（如 2330、6278）。"
-        )
+    resolved_code, display_name = resolve_stock_input(raw_symbol)
+    if not resolved_code:
+        st.error(f"找不到符合「{raw_symbol}」的標的，請重新輸入。")
         return
 
-    with st.spinner(f"正在查詢 {raw_symbol} 財報…"):
+    with st.spinner(f"正在查詢 {display_name} 財報…"):
         try:
-            data, resolved = get_financial_reports(raw_symbol, quarterly=quarterly)
+            data, resolved = get_financial_reports(resolved_code, quarterly=quarterly)
         except Exception as e:
             st.error(
                 f"查詢失敗：{e}\n\n"
@@ -856,14 +855,13 @@ def render_financial_page() -> None:
             )
             return
 
-    is_tw     = _TW_CODE_RE.match(raw_symbol.strip().upper()) is not None
-    unit_note = "億元（新台幣）" if is_tw else "B / M（原始報告貨幣）"
+    unit_note = "億元（新台幣）"
 
-    st.markdown(f"##### {resolved}　財務報告（{period}）")
+    st.markdown(f"##### {display_name}　財務報告（{period}）")
 
     if all(v is None for v in data.values()):
         st.warning(
-            f"查無 **{resolved}** 的財報資料。\n\n"
+            f"查無 **{display_name}** 的財報資料。\n\n"
             "可能原因：\n"
             "- 代號錯誤或 FinMind API 尚未收錄此標的\n"
             "- 目前為非交易時段，資料尚未更新\n"

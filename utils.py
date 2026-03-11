@@ -4,10 +4,13 @@
 """
 
 import os
+import re
+import requests
 from datetime import datetime, timedelta
 from typing import List, Optional
 
 import pandas as pd
+import streamlit as st
 from dotenv import load_dotenv
 from fugle_marketdata import RestClient
 
@@ -15,6 +18,64 @@ load_dotenv()
 
 # Fugle API 單次查詢上限（API 要求 < 365 天，保留 5 天緩衝）
 _FUGLE_MAX_RANGE_DAYS = 360
+
+# ── 台股代號識別（4~6 位純數字）
+_TW_CODE_RE = re.compile(r"^\d{4,6}$")
+_FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+
+
+# ═════════════════════════════════════════════
+# 台股名稱解析（代號 ↔ 中文名稱互轉）
+# ═════════════════════════════════════════════
+
+@st.cache_data(ttl=86400)
+def get_stock_mapping() -> pd.DataFrame:
+    """取得 FinMind 台股代號與中文名稱對應表（每日快取）。"""
+    try:
+        resp = requests.get(
+            _FINMIND_URL,
+            params={"dataset": "TaiwanStockInfo"},
+            timeout=15,
+        )
+        records = resp.json().get("data", [])
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame(records)[["stock_id", "stock_name"]].astype(str)
+    except Exception:
+        return pd.DataFrame()
+
+
+def resolve_stock_input(user_input: str) -> tuple[str | None, str]:
+    """
+    解析使用者輸入，支援數字代號或中文股名。
+
+    Returns
+    -------
+    (純數字代號, 顯示名稱 "代號 股名")
+    找不到時回傳 (None, 原始輸入)
+    """
+    query = user_input.strip()
+    if not query:
+        return None, query
+
+    mapping_df = get_stock_mapping()
+    if mapping_df.empty:
+        return (query, query) if _TW_CODE_RE.match(query) else (None, query)
+
+    if _TW_CODE_RE.match(query):
+        match_row = mapping_df[mapping_df["stock_id"] == query]
+        if not match_row.empty:
+            return query, f'{query} {match_row.iloc[0]["stock_name"]}'
+        return query, query
+    else:
+        match_row = mapping_df[mapping_df["stock_name"] == query]
+        if match_row.empty:
+            match_row = mapping_df[mapping_df["stock_name"].str.contains(query, na=False)]
+        if not match_row.empty:
+            code = str(match_row.iloc[0]["stock_id"])
+            name = str(match_row.iloc[0]["stock_name"])
+            return code, f"{code} {name}"
+        return None, query
 
 
 # ═════════════════════════════════════════════

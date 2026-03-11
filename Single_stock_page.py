@@ -16,6 +16,7 @@ from utils import (
     compute_ma, compute_kd,
     compute_bollinger, compute_rsi, compute_macd,
     detect_all_candlestick_patterns,
+    resolve_stock_input,
 )
 
 
@@ -947,9 +948,9 @@ def render_single_stock_page() -> None:
         col_a, col_b = st.columns(2)
         with col_a:
             symbol = st.text_input(
-                "股票代號", value="1815", max_chars=10,
+                "股票代號/名稱", value="1815", max_chars=20,
                 key="single_stock_symbol",
-                help="輸入台灣股票代號，例如 1815、2345、0050",
+                help="支援台灣股票。可輸入數字代號 (如 2330) 或中文股名 (如 台積電)。",
             ).strip()
         with col_b:
             limit = st.number_input(
@@ -981,8 +982,14 @@ def render_single_stock_page() -> None:
         return
 
     if not symbol:
-        st.error("股票代號不得為空，請重新輸入。")
+        st.error("請輸入股票代號或名稱。")
         return
+
+    resolved_code, display_name = resolve_stock_input(symbol)
+    if not resolved_code:
+        st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
+        return
+    symbol = display_name
 
     # 決定需要哪些 MA 期數
     ma_periods = [p for p, flag in [(5, show_ma5), (10, show_ma10), (20, show_ma20)] if flag]
@@ -998,7 +1005,7 @@ def render_single_stock_page() -> None:
     with st.spinner(f"正在取得 {symbol} 的歷史資料…"):
         try:
             df_full = fetch_stock_candles(
-                symbol=symbol,
+                symbol=resolved_code,
                 limit=fetch_limit,
                 fields="open,high,low,close,volume,turnover",
             )

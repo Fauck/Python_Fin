@@ -46,18 +46,18 @@ def main() -> None:
 
     # ── 依開關狀態動態組建 Tab 列表 ──────────────────────────────────
     if hide_strategy:
-        (tab_single, tab_score, tab_chips,
-         tab_fin, tab_news, tab_valuation) = st.tabs([
-            "📈 單股分析", "🎯 綜合評分", "🏦 籌碼分析",
-            "📋 財務報告", "📰 財經新聞", "💎 估值分析",
+        (tab_single,
+         tab_fin, tab_valuation, tab_score, tab_chips, tab_news) = st.tabs([
+            "📈 單股分析",
+            "📋 財務報告", "💎 估值分析", "🎯 綜合評分", "🏦 籌碼分析", "📰 財經新聞",
         ])
         tab_screener = None
         tab_backtest = None
     else:
-        (tab_single, tab_screener, tab_score,
-         tab_chips, tab_backtest, tab_fin, tab_news, tab_valuation) = st.tabs([
-            "📈 單股分析", "🔍 選股策略", "🎯 綜合評分",
-            "🏦 籌碼分析", "🔁 策略回測", "📋 財務報告", "📰 財經新聞", "💎 估值分析",
+        (tab_single, tab_fin, tab_valuation, tab_screener, tab_score,
+         tab_chips, tab_backtest, tab_news) = st.tabs([
+            "📈 單股分析", "📋 財務報告", "💎 估值分析", "🔍 選股策略", "🎯 綜合評分",
+            "🏦 籌碼分析", "🔁 策略回測", "📰 財經新聞",
         ])
 
     with tab_single:
