@@ -24,6 +24,7 @@ import feedparser
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from utils import pull_shared_symbol
 
 
 # ── Google News RSS 端點（繁體中文台灣版）
@@ -471,6 +472,7 @@ def _render_ptt_section(
 
 def render_news_page() -> None:
     """關鍵字財經新聞頁面（Tab 7）。"""
+    pull_shared_symbol("news_mops_symbol")
     ctrl_col, result_col = st.columns([1, 3], gap="large")
 
     with ctrl_col:

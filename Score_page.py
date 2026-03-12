@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from chips_analyzer import fetch_dividends
-from utils import fetch_stock_candles, resolve_stock_input
+from utils import fetch_stock_candles, resolve_stock_input, push_shared_symbol, pull_shared_symbol
 
 
 # ═════════════════════════════════════════════
@@ -409,6 +409,7 @@ def render_radar_chart(score_result: Dict[str, Any]) -> None:
 
 def render_score_page() -> None:
     """個股綜合評分頁面（雙模式 100 分制買進指標）。"""
+    pull_shared_symbol("score_page_symbol")
     with st.expander("🔍 查詢條件設定與操作", expanded=True):
         symbol = st.text_input(
             "股票代號/名稱", value="2330", max_chars=20,
@@ -452,6 +453,7 @@ def render_score_page() -> None:
     if not resolved_code:
         st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
         return
+    push_shared_symbol(resolved_code)
     symbol = display_name
 
     with st.spinner(f"正在分析 {symbol}…"):

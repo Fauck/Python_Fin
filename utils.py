@@ -78,6 +78,37 @@ def resolve_stock_input(user_input: str) -> tuple[str | None, str]:
         return None, query
 
 
+# ─────────────────────────────────────────────
+# 跨頁股票代號同步（Cross-page symbol sync）
+# ─────────────────────────────────────────────
+
+def push_shared_symbol(symbol: str) -> None:
+    """
+    查詢成功後呼叫：將解析後的股票代號廣播至 session_state。
+    其他頁面下次渲染時透過 pull_shared_symbol 自動帶入輸入框。
+    """
+    st.session_state["shared_symbol"]     = symbol
+    st.session_state["shared_symbol_ver"] = (
+        st.session_state.get("shared_symbol_ver", 0) + 1
+    )
+
+
+def pull_shared_symbol(page_key: str) -> None:
+    """
+    各頁面 render 函式最頂端呼叫：若全域共用代號版本比本頁新，
+    自動把共用代號寫入本頁輸入框的 session_state[page_key]。
+
+    版本比較確保「同一次查詢」只同步一次，不會覆蓋使用者在本頁的後續輸入。
+    """
+    global_ver = st.session_state.get("shared_symbol_ver", 0)
+    local_key  = f"{page_key}__ssver"
+    if global_ver > st.session_state.get(local_key, -1):
+        shared = st.session_state.get("shared_symbol", "")
+        if shared:
+            st.session_state[page_key] = shared
+        st.session_state[local_key] = global_ver
+
+
 # ═════════════════════════════════════════════
 # 資料層：API 呼叫邏輯（與 UI 完全解耦）
 # ═════════════════════════════════════════════

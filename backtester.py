@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils import fetch_stock_candles, compute_atr, resolve_stock_input
+from utils import fetch_stock_candles, compute_atr, resolve_stock_input, push_shared_symbol, pull_shared_symbol
 from Screener_page import (
     check_consolidation_breakout,
     check_bullish_ma_alignment,
@@ -310,6 +310,7 @@ def _cached_backtest(
 
 def render_backtest_page() -> None:
     """策略歷史回測頁面（Tab 5）。"""
+    pull_shared_symbol("bt_symbol")
     with st.expander("🔍 查詢條件設定與操作", expanded=True):
         col_a, col_b = st.columns(2)
         with col_a:
@@ -401,6 +402,7 @@ def render_backtest_page() -> None:
     if not resolved_code:
         st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
         return
+    push_shared_symbol(resolved_code)
     symbol = display_name
 
     with st.spinner(f"正在執行 {symbol} × {strategy_name} 回測…"):

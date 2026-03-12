@@ -24,7 +24,7 @@ from plotly.subplots import make_subplots
 
 from financial_translations import METRICS_COL_ZH as _METRICS_COL_ZH
 from financial_translations import STMT_INDEX_ZH as _STMT_INDEX_ZH
-from utils import resolve_stock_input
+from utils import resolve_stock_input, push_shared_symbol, pull_shared_symbol
 
 
 # ── 台股純數字代號識別（4~6 位）
@@ -754,6 +754,7 @@ def analyze_financials(
 
 def render_financial_page() -> None:
     """企業財務報告頁面（Tab 6）。"""
+    pull_shared_symbol("fin_symbol")
     with st.expander("🔍 查詢條件設定與操作", expanded=True):
         col_a, col_b = st.columns(2)
         with col_a:
@@ -844,6 +845,7 @@ def render_financial_page() -> None:
     if not resolved_code:
         st.error(f"找不到符合「{raw_symbol}」的標的，請重新輸入。")
         return
+    push_shared_symbol(resolved_code)
 
     with st.spinner(f"正在查詢 {display_name} 財報…"):
         try:

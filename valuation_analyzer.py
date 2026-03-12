@@ -23,7 +23,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from utils import fetch_stock_candles, resolve_stock_input
+from utils import fetch_stock_candles, resolve_stock_input, push_shared_symbol, pull_shared_symbol
 
 # ── FinMind API 設定
 _FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
@@ -940,6 +940,7 @@ def _render_results(cache: Dict[str, Any]) -> None:
 
 def render_valuation_page() -> None:
     """估值分析頁面（Tab 8）。"""
+    pull_shared_symbol("val_symbol")
 
     # session_state 保存查詢結果，避免圖表因互動消失
     if "val_cache" not in st.session_state:
@@ -1034,6 +1035,7 @@ def render_valuation_page() -> None:
                 st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
                 st.session_state["val_cache"] = None
             else:
+                push_shared_symbol(resolved_code)
                 with st.spinner(f"正在取得 {display_name} 歷史資料（{years} 年）…"):
                     try:
                         data = fetch_valuation_data(symbol=resolved_code, years=years)

@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from utils import fetch_stock_candles, get_fugle_client, resolve_stock_input
+from utils import fetch_stock_candles, get_fugle_client, resolve_stock_input, push_shared_symbol, pull_shared_symbol
 
 
 # ═════════════════════════════════════════════
@@ -308,6 +308,7 @@ def _render_insti_chart(
 
 def render_chips_page() -> None:
     """籌碼與基本面分析頁面（Tab 4）。"""
+    pull_shared_symbol("chips_page_symbol")
     with st.expander("🔍 查詢條件設定與操作", expanded=True):
         col_a, col_b = st.columns(2)
         with col_a:
@@ -348,6 +349,7 @@ def render_chips_page() -> None:
     if not resolved_code:
         st.error(f"找不到符合「{symbol}」的標的，請重新輸入。")
         return
+    push_shared_symbol(resolved_code)
     symbol = display_name
 
     with st.spinner(f"正在取得 {symbol} 資料…"):
