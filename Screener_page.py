@@ -9,8 +9,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
-from utils import fetch_stock_candles
+from utils import compute_ma, fetch_stock_candles
 
+
+# ─────────────────────────────────────────────
+# 防禦模式：套用大盤濾網的突破型策略集合
+# ─────────────────────────────────────────────
+_DEFENSE_STRATEGIES = {"盤整突破第一根", "爆量長紅起漲", "52週高點突破", "布林擠壓突破"}
 
 # ═════════════════════════════════════════════
 # 演算法層：各策略判斷函式（純邏輯，不含 Streamlit 元素）
@@ -446,12 +451,58 @@ def scan_watchlist(
     return results, errors
 
 
+# ═════════════════════════════════════════════
+# 大盤環境濾網（Market Environment Filter）
+# ═════════════════════════════════════════════
+
+@st.cache_data(ttl=900)
+def get_market_trend() -> dict:
+    """
+    抓取加權指數（IX0001）K 線，判斷目前大盤多空環境。
+
+    Returns
+    -------
+    dict with keys:
+        status : "bullish" | "bearish" | "unknown"
+        close  : float | None   最新收盤點位
+        ma20   : float | None   20 日均線
+        ma60   : float | None   60 日均線
+    """
+    try:
+        df = fetch_stock_candles(symbol="IX0001", limit=100)
+        if df.empty or len(df) < 60:
+            return {"status": "unknown", "close": None, "ma20": None, "ma60": None}
+
+        df = compute_ma(df, [20, 60])
+        latest = df.iloc[-1]
+
+        close = float(latest["close"])
+        ma20  = latest.get("ma20")
+        ma60  = latest.get("ma60")
+
+        if ma20 is None or ma60 is None or pd.isna(ma20) or pd.isna(ma60):
+            return {"status": "unknown", "close": close, "ma20": None, "ma60": None}
+
+        ma20 = float(ma20)
+        ma60 = float(ma60)
+        is_bullish = close > ma20 and close > ma60
+
+        return {
+            "status": "bullish" if is_bullish else "bearish",
+            "close": round(close, 2),
+            "ma20":  round(ma20, 2),
+            "ma60":  round(ma60, 2),
+        }
+    except Exception:
+        return {"status": "unknown", "close": None, "ma20": None, "ma60": None}
+
+
 # ─────────────────────────────────────────────
 # 選股頁面：各策略的 UI 設定區塊
 # ─────────────────────────────────────────────
 
-def _render_breakout_params() -> Tuple[Callable, int, str]:
-    """盤整突破第一根：渲染參數控制項，回傳 (strategy_fn, fetch_limit, hint)。"""
+def _render_breakout_params(defense_boost: float = 0.0) -> Tuple[Callable, int, str, Optional[float]]:
+    """盤整突破第一根：渲染參數控制項，回傳 (strategy_fn, fetch_limit, hint, effective_vol_ratio)。"""
     # ── 盤整天數 N ──  ↑增大→更長期盤整；↓減小→短期盤整
     consolidation_days = st.number_input(
         "盤整天數（N）", min_value=5, max_value=60, value=21, step=1,
@@ -471,13 +522,17 @@ def _render_breakout_params() -> Tuple[Callable, int, str]:
         help="今日成交量需大於近 5 日均量的幾倍，預設 1.5",
     )
 
-    n      = int(consolidation_days)
-    amp    = amplitude_pct / 100.0
-    vr     = float(volume_ratio)
-    chk    = check_volume
+    n   = int(consolidation_days)
+    amp = amplitude_pct / 100.0
+    vr  = float(volume_ratio)
+    chk = check_volume
+
+    effective_vr = round(max(vr + defense_boost, 2.5), 1) if (defense_boost > 0 and chk) else vr
+    if defense_boost > 0 and chk:
+        st.caption(f"防禦模式：量能門檻已自動提升至 **{effective_vr:.1f}** 倍（原設定 {vr:.1f}）")
 
     vol_line = (
-        f"- **條件 C**：今日量 > 近 5 日均量 × {vr:.1f} 倍（帶量突破）"
+        f"- **條件 C**：今日量 > 近 5 日均量 × {effective_vr:.1f} 倍（帶量突破）"
         if chk else "- 條件 C：已停用"
     )
     info = (
@@ -487,10 +542,15 @@ def _render_breakout_params() -> Tuple[Callable, int, str]:
         + vol_line
     )
 
-    return lambda df: check_consolidation_breakout(df, n, amp, vr, chk), n + 10, info
+    return (
+        lambda df: check_consolidation_breakout(df, n, amp, effective_vr, chk),
+        n + 10,
+        info,
+        effective_vr if chk else None,
+    )
 
 
-def _render_ma_alignment_params() -> Tuple[Callable, int, str]:
+def _render_ma_alignment_params() -> Tuple[Callable, int, str, Optional[float]]:
     """均線多頭排列：無額外參數，直接使用固定均線。"""
     st.caption("使用固定參數：5MA / 10MA / 20MA")
     info = (
@@ -498,10 +558,10 @@ def _render_ma_alignment_params() -> Tuple[Callable, int, str]:
         "- **收盤價 > 5MA**（維持強勢均線上方）\n"
         "- **20MA 趨勢向上**（今日 20MA > 昨日 20MA）"
     )
-    return check_bullish_ma_alignment, 30, info
+    return check_bullish_ma_alignment, 30, info, None
 
 
-def _render_volume_surge_params() -> Tuple[Callable, int, str]:
+def _render_volume_surge_params(defense_boost: float = 0.0) -> Tuple[Callable, int, str, Optional[float]]:
     """爆量長紅起漲：渲染參數控制項。"""
     # ── 爆量倍數 ── ↑增大→要求更強爆量
     vol_ratio = st.slider(
@@ -514,18 +574,22 @@ def _render_volume_surge_params() -> Tuple[Callable, int, str]:
         help="(收盤 - 開盤) / 開盤 的最小漲幅，預設 3%",
     )
 
-    vr  = float(vol_ratio)
+    vr   = float(vol_ratio)
     bpct = body_pct / 100.0
+    effective_vr = round(max(vr + defense_boost, 2.5), 1) if defense_boost > 0 else vr
+
+    if defense_boost > 0:
+        st.caption(f"防禦模式：量能門檻已自動提升至 **{effective_vr:.1f}** 倍（原設定 {vr:.1f}）")
 
     info = (
-        f"- **爆量**：今日量 > 5 日均量 × {vr:.1f} 倍\n"
+        f"- **爆量**：今日量 > 5 日均量 × {effective_vr:.1f} 倍\n"
         f"- **長紅**：收盤 > 開盤，且 K 棒實體漲幅 > {body_pct}%\n"
         "- **收高**：今日收盤為近 5 日最高收盤價"
     )
-    return lambda df: check_volume_surge_bullish(df, vr, bpct), 15, info
+    return lambda df: check_volume_surge_bullish(df, effective_vr, bpct), 15, info, effective_vr
 
 
-def _render_oversold_reversal_params() -> Tuple[Callable, int, str]:
+def _render_oversold_reversal_params() -> Tuple[Callable, int, str, Optional[float]]:
     """乖離過大跌深反彈：渲染參數控制項。"""
     # ── 負乖離門檻 ── ↓減小→要求更深超跌
     bias_pct = st.slider(
@@ -546,10 +610,10 @@ def _render_oversold_reversal_params() -> Tuple[Callable, int, str]:
         "- **紅 K**：今日收盤 > 開盤（止跌訊號）\n"
         f"- **下影線**：下影線長度 ≥ K棒實體 × {sr:.2f}（帶下影線的紅棒）"
     )
-    return lambda df: check_oversold_reversal(df, bpct, sr), 30, info
+    return lambda df: check_oversold_reversal(df, bpct, sr), 30, info, None
 
 
-def _render_52week_params() -> Tuple[Callable, int, str]:
+def _render_52week_params(defense_boost: float = 0.0) -> Tuple[Callable, int, str, Optional[float]]:
     """52 週高點突破：渲染參數控制項。"""
     vol_ratio = st.slider(
         "量能確認倍數", min_value=1.0, max_value=3.0, value=1.3, step=0.1,
@@ -557,15 +621,20 @@ def _render_52week_params() -> Tuple[Callable, int, str]:
         key="sc_52w_vol",
     )
     vr = float(vol_ratio)
+    effective_vr = round(max(vr + defense_boost, 2.5), 1) if defense_boost > 0 else vr
+
+    if defense_boost > 0:
+        st.caption(f"防禦模式：量能門檻已自動提升至 **{effective_vr:.1f}** 倍（原設定 {vr:.1f}）")
+
     info = (
         "- **52週高點**：今日收盤 > 前 252 個交易日最高收盤價\n"
-        f"- **量能確認**：今日量 > 5 日均量 × {vr:.1f} 倍\n"
+        f"- **量能確認**：今日量 > 5 日均量 × {effective_vr:.1f} 倍\n"
         "- 動能加速訊號，配合趨勢順勢使用效果更佳"
     )
-    return lambda df: check_52week_high_breakout(df, vr), 270, info
+    return lambda df: check_52week_high_breakout(df, effective_vr), 270, info, effective_vr
 
 
-def _render_bb_squeeze_params() -> Tuple[Callable, int, str]:
+def _render_bb_squeeze_params(defense_boost: float = 0.0) -> Tuple[Callable, int, str, Optional[float]]:
     """布林通道壓縮突破（升級版）：渲染參數控制項。"""
     period = st.number_input(
         "布林週期", min_value=10, max_value=60, value=20, step=1,
@@ -600,14 +669,18 @@ def _render_bb_squeeze_params() -> Tuple[Callable, int, str]:
     bwt = float(bw_threshold)
     lb  = int(lookback)
     vr  = float(vol_ratio)
+    effective_vr = round(max(vr + defense_boost, 2.5), 1) if defense_boost > 0 else vr
+
+    if defense_boost > 0:
+        st.caption(f"防禦模式：量能門檻已自動提升至 **{effective_vr:.1f}** 倍（原設定 {vr:.1f}）")
 
     info = (
         f"- **壓縮判定**：過去 {lb} 日平均帶寬 < {bwt*100:.0f}%（籌碼極度壓縮）\n"
         f"- **突破上軌**：今日收盤 > 布林上軌（{sd:.1f}σ，週期 {p}）\n"
-        f"- **量能確認**：今日量 > 5 日均量 × {vr:.1f} 倍\n"
+        f"- **量能確認**：今日量 > 5 日均量 × {effective_vr:.1f} 倍\n"
         "- 三條件同時成立，為壓縮後爆發型高勝率買點"
     )
-    return lambda df: check_bollinger_squeeze_breakout(df, p, sd, bwt, lb, vr), p + 50, info
+    return lambda df: check_bollinger_squeeze_breakout(df, p, sd, bwt, lb, effective_vr), p + 50, info, effective_vr
 
 
 # ─────────────────────────────────────────────
@@ -638,10 +711,34 @@ NO_RESULT_HINTS: Dict[str, str] = {
 
 def render_screener_page() -> None:
     """選股策略頁面（多策略版）。"""
-    ctrl_col, result_col = st.columns([1, 3], gap="large")
 
-    with ctrl_col:
-        st.markdown("#### 選股策略")
+    # ── 1. 大盤環境濾網 ─────────────────────────────────────────
+    market = get_market_trend()
+    if market["status"] == "bullish":
+        close_str = f"{market['close']:,.2f}" if market["close"] is not None else "—"
+        ma20_str  = f"{market['ma20']:,.2f}"  if market["ma20"]  is not None else "—"
+        ma60_str  = f"{market['ma60']:,.2f}"  if market["ma60"]  is not None else "—"
+        st.info(
+            f"🟢 **大盤多頭格局**：加權指數站上月線與季線，突破策略維持標準參數。"
+            f"  （指數 {close_str}｜20MA {ma20_str}｜60MA {ma60_str}）"
+        )
+        defense_boost = 0.0
+    elif market["status"] == "bearish":
+        close_str = f"{market['close']:,.2f}" if market["close"] is not None else "—"
+        ma20_str  = f"{market['ma20']:,.2f}"  if market["ma20"]  is not None else "—"
+        ma60_str  = f"{market['ma60']:,.2f}"  if market["ma60"]  is not None else "—"
+        st.warning(
+            f"🔴 **大盤空頭/震盪格局**：加權指數跌破重要均線，已自動啟動【防禦模式】，"
+            f"提高突破策略的量能門檻防範假突破。"
+            f"  （指數 {close_str}｜20MA {ma20_str}｜60MA {ma60_str}）"
+        )
+        defense_boost = 1.0
+    else:
+        st.info("⚪ 大盤狀態無法判斷（IX0001 資料抓取失敗），策略參數維持使用者設定。")
+        defense_boost = 0.0
+
+    # ── 2. 查詢條件設定（折疊控制區）────────────────────────────
+    with st.expander("🔍 查詢條件設定", expanded=True):
         strategy = st.selectbox(
             "選擇策略",
             options=list(STRATEGY_REGISTRY.keys()),
@@ -649,17 +746,19 @@ def render_screener_page() -> None:
         )
 
         st.markdown("---")
-        st.markdown("#### 策略參數")
+        st.markdown("##### 策略參數")
 
-        # 依選擇的策略渲染對應參數，並取得策略函式
         render_params_fn = STRATEGY_REGISTRY[strategy]
-        strategy_fn, fetch_limit, info_text = render_params_fn()
+        # 防禦型突破策略支援 defense_boost；反彈型策略無量能門檻，直接呼叫
+        if strategy in _DEFENSE_STRATEGIES:
+            strategy_fn, fetch_limit, info_text, effective_vr = render_params_fn(
+                defense_boost=defense_boost
+            )
+        else:
+            strategy_fn, fetch_limit, info_text, effective_vr = render_params_fn()
 
         st.markdown("---")
-        scan_btn = st.button("開始掃描", type="primary", use_container_width=True)
-
-    with result_col:
-        st.markdown("#### 觀察清單")
+        st.markdown("##### 觀察清單")
         watchlist_input = st.text_area(
             "輸入股票代號（以逗號分隔）",
             value="2330, 1815, 2317, 2454, 3231",
@@ -667,58 +766,67 @@ def render_screener_page() -> None:
             help="輸入欲掃描的股票代號，以逗號分隔。因 API 限制，建議清單勿超過 30 檔。",
         )
 
-        st.info(f"**{strategy} 判定邏輯**\n\n{info_text}")
+        scan_btn = st.button("開始掃描", type="primary", use_container_width=True)
 
-        if not scan_btn:
-            return
+    # ── 3. 策略說明 ──────────────────────────────────────────────
+    st.info(f"**{strategy} 判定邏輯**\n\n{info_text}")
 
-        # 解析觀察清單
-        symbols = [s.strip() for s in watchlist_input.split(",") if s.strip()]
-        if not symbols:
-            st.error("觀察清單為空，請至少輸入一個股票代號。")
-            return
+    if not scan_btn:
+        return
 
-        # 批次掃描（含進度列）
-        progress_bar = st.progress(0, text="準備掃描…")
-        status_text  = st.empty()
-
-        def _on_progress(p: float) -> None:
-            progress_bar.progress(p)
-
-        def _on_status(msg: str) -> None:
-            status_text.text(msg)
-
-        results, errors = scan_watchlist(
-            symbols=symbols,
-            strategy_fn=strategy_fn,
-            fetch_limit=fetch_limit,
-            sleep_sec=0.2,
-            progress_callback=_on_progress,
-            status_callback=_on_status,
+    # ── 4. 防禦模式 Toast 提示 ───────────────────────────────────
+    if defense_boost > 0 and strategy in _DEFENSE_STRATEGIES and effective_vr is not None:
+        st.toast(
+            f"防禦模式已啟動，量能門檻已提升至 {effective_vr:.1f} 倍",
+            icon="⚠️",
         )
 
-        progress_bar.empty()
-        status_text.empty()
+    # ── 5. 解析觀察清單 ──────────────────────────────────────────
+    symbols = [s.strip() for s in watchlist_input.split(",") if s.strip()]
+    if not symbols:
+        st.error("觀察清單為空，請至少輸入一個股票代號。")
+        return
 
-        # 結果展示
-        st.markdown("---")
-        st.subheader(f"掃描結果（共 {len(symbols)} 檔，符合 {len(results)} 檔）")
+    # ── 6. 批次掃描（含進度列）──────────────────────────────────
+    progress_bar = st.progress(0, text="準備掃描…")
+    status_text  = st.empty()
 
-        if results:
-            st.success(f"找到 **{len(results)}** 檔符合「{strategy}」的股票：")
-            result_df = pd.DataFrame(results)
-            # 對所有數值欄位格式化為小數點後兩位
-            float_cols = result_df.select_dtypes(include="float").columns
-            fmt: Dict[str, Any] = {col: "{:.2f}" for col in float_cols}
-            st.dataframe(
-                result_df.style.format(fmt, na_rep="—"),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            hint = NO_RESULT_HINTS.get(strategy, "請調整參數後重新掃描。")
-            st.warning(f"本次掃描未找到符合「{strategy}」條件的股票。\n\n{hint}")
+    def _on_progress(p: float) -> None:
+        progress_bar.progress(p)
 
-        if errors:
-            with st.expander(f"查詢異常清單（{len(errors)} 檔）"):
-                st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
+    def _on_status(msg: str) -> None:
+        status_text.text(msg)
+
+    results, errors = scan_watchlist(
+        symbols=symbols,
+        strategy_fn=strategy_fn,
+        fetch_limit=fetch_limit,
+        sleep_sec=0.2,
+        progress_callback=_on_progress,
+        status_callback=_on_status,
+    )
+
+    progress_bar.empty()
+    status_text.empty()
+
+    # ── 7. 結果展示 ──────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader(f"掃描結果（共 {len(symbols)} 檔，符合 {len(results)} 檔）")
+
+    if results:
+        st.success(f"找到 **{len(results)}** 檔符合「{strategy}」的股票：")
+        result_df = pd.DataFrame(results)
+        float_cols = result_df.select_dtypes(include="float").columns
+        fmt: Dict[str, Any] = {col: "{:.2f}" for col in float_cols}
+        st.dataframe(
+            result_df.style.format(fmt, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        hint = NO_RESULT_HINTS.get(strategy, "請調整參數後重新掃描。")
+        st.warning(f"本次掃描未找到符合「{strategy}」條件的股票。\n\n{hint}")
+
+    if errors:
+        with st.expander(f"查詢異常清單（{len(errors)} 檔）"):
+            st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)

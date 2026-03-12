@@ -199,3 +199,34 @@ custom_to   = st.date_input("結束日期",  value=None)
 source Fauck_env/bin/activate
 streamlit run app.py
 ```
+
+---
+
+# 全域開發與 UI 指導原則 (Global UI & Development Guidelines)
+
+這是一個基於 Streamlit 開發的台股量化分析 Web App。
+未來的每一次修改與新增功能，請務必嚴格遵守以下「行動裝置優先 (Mobile-Friendly) 與響應式 (RWD)」的 UI 設計準則，不需要我每次額外提醒：
+
+## 1. 版面配置原則 (Layout)
+
+* **絕對禁用全域左右分欄**：嚴禁使用 `col1, col2 = st.columns([1, 3])` 將控制面板與圖表左右拆分。在手機上會導致嚴重的排版災難與無盡的垂直滾動。
+* **頂部折疊控制區**：所有的輸入框 (text_input)、選項 (radio/selectbox) 與按鈕，必須統一放在頁面最上方的 `st.expander("🔍 查詢條件設定", expanded=True)` 中。
+* **內部自適應分欄**：在 `st.expander` 內部可以使用 `st.columns` 進行水平排列，Streamlit 會在手機版自動將其轉換為垂直堆疊。
+
+## 2. 圖表自適應最佳化 (Plotly Charts)
+
+所有的 Plotly 圖表 (`go.Figure`) 在 `update_layout` 時，必須包含以下設定，以最大化手機螢幕利用率：
+
+* **極小化邊距**：`margin=dict(l=10, r=10, t=50, b=10)`
+* **圖例水平排列**：`legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0)`，絕對不要讓圖例擠壓到右側的 K 線圖空間。
+* **適應寬度**：在 Streamlit 渲染時，務必加上 `st.plotly_chart(fig, use_container_width=True)`。
+
+## 3. 數據與表格顯示 (Metrics & Dataframes)
+
+* **指標卡片 (st.metric)**：若有超過 3 個指標，請使用多排的 `st.columns` (例如兩個 `st.columns(4)`)，避免在手機上文字重疊破版。
+* **表格 (st.dataframe)**：所有表格必須加上 `use_container_width=True` 與 `hide_index=True`，方便在手機上橫向滑動查看。
+
+## 4. 防呆與錯誤處理
+
+* **資料擷取**：呼叫 FinMind 或 Fugle API 時，必須妥善處理空值 (`None` 或 `NaN`)。若查無資料，請使用 `st.warning` 或 `st.info` 顯示友善提示，絕不可拋出紅字 Exception。
+* **禁止數學公式語法**：在任何 UI 顯示文字或卡片說明中，禁止使用 LaTeX 語法（嚴禁使用 $ 符號包覆文字）。數值請直接轉為字串格式化，例如 `15.2%`。

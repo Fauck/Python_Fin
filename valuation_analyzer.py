@@ -207,6 +207,10 @@ def fetch_valuation_data(symbol: str, years: int = 5) -> Optional[Dict[str, Any]
                 price_df["close"][dy_valid] * (aligned_per["dividend_yield"][dy_valid] / 100.0)
             )
 
+    # 平滑化：濾除 FinMind P/E 反推時產生的微小數學雜訊（5 日移動平均）
+    eps_daily  = eps_daily.rolling(window=5, min_periods=1).mean()
+    bvps_daily = bvps_daily.rolling(window=5, min_periods=1).mean()
+
     current_eps  = _to_float(eps_daily.dropna().iloc[-1])  if not eps_daily.dropna().empty  else None
     current_bvps = _to_float(bvps_daily.dropna().iloc[-1]) if not bvps_daily.dropna().empty else None
     current_div  = _to_float(div_daily.dropna().iloc[-1])  if not div_daily.dropna().empty  else None
@@ -441,19 +445,25 @@ def compute_pe_bands(
     valid        = eps_daily.notna() & (eps_daily > 0)
     ratio_series = (price_df["close"][valid] / eps_daily[valid]).dropna()
 
+    bands: Dict[str, pd.Series] = {}
+
     if custom_levels is not None:
         pe_levels: List[float] = sorted(custom_levels)          # 強制升冪
+        for i, lvl in enumerate(pe_levels):
+            bands[_BAND_LABELS[i]] = (eps_daily * lvl).where(eps_daily > 0)
     else:
-        if len(ratio_series) < 30:
+        # 滾動分位數（消除未來函數）：window=750 筆約 3 年，min_periods=250 約 1 年
+        if len(ratio_series) < 250:
             return None
-        hist_levels = _five_equal_levels(ratio_series)
-        if hist_levels is None:
-            return None
-        pe_levels = hist_levels
+        _QUANTILES    = [0.10, 0.30, 0.50, 0.70, 0.90]
+        rolling_obj   = ratio_series.rolling(window=750, min_periods=250)
+        q_series_list = [rolling_obj.quantile(q) for q in _QUANTILES]
+        # 取各分位數最新值作為 pe_levels（供 current_bands / 統計摘要使用）
+        pe_levels = [float(q_s.dropna().iloc[-1]) for q_s in q_series_list]
+        for i, q_s in enumerate(q_series_list):
+            aligned_q = q_s.reindex(price_df.index).ffill()
+            bands[_BAND_LABELS[i]] = (eps_daily * aligned_q).where(eps_daily > 0)
 
-    bands: Dict[str, pd.Series] = {}
-    for i, lvl in enumerate(pe_levels):
-        bands[_BAND_LABELS[i]] = (eps_daily * lvl).where(eps_daily > 0)
     bands_df = pd.DataFrame(bands, index=price_df.index)
 
     current_bands = sorted([lvl * current_eps for lvl in pe_levels])  # 升冪保證
@@ -490,19 +500,24 @@ def compute_pb_bands(
     valid        = bvps_daily.notna() & (bvps_daily > 0)
     ratio_series = (price_df["close"][valid] / bvps_daily[valid]).dropna()
 
+    bands: Dict[str, pd.Series] = {}
+
     if custom_levels is not None:
         pb_levels: List[float] = sorted(custom_levels)          # 強制升冪
+        for i, lvl in enumerate(pb_levels):
+            bands[_BAND_LABELS[i]] = (bvps_daily * lvl).where(bvps_daily > 0)
     else:
-        if len(ratio_series) < 30:
+        # 滾動分位數（消除未來函數）：window=750 筆約 3 年，min_periods=250 約 1 年
+        if len(ratio_series) < 250:
             return None
-        hist_levels = _five_equal_levels(ratio_series)
-        if hist_levels is None:
-            return None
-        pb_levels = hist_levels
+        _QUANTILES    = [0.10, 0.30, 0.50, 0.70, 0.90]
+        rolling_obj   = ratio_series.rolling(window=750, min_periods=250)
+        q_series_list = [rolling_obj.quantile(q) for q in _QUANTILES]
+        pb_levels = [float(q_s.dropna().iloc[-1]) for q_s in q_series_list]
+        for i, q_s in enumerate(q_series_list):
+            aligned_q = q_s.reindex(price_df.index).ffill()
+            bands[_BAND_LABELS[i]] = (bvps_daily * aligned_q).where(bvps_daily > 0)
 
-    bands: Dict[str, pd.Series] = {}
-    for i, lvl in enumerate(pb_levels):
-        bands[_BAND_LABELS[i]] = (bvps_daily * lvl).where(bvps_daily > 0)
     bands_df = pd.DataFrame(bands, index=price_df.index)
 
     current_bands = sorted([lvl * current_bvps for lvl in pb_levels])  # 升冪保證
@@ -593,10 +608,12 @@ def compute_yield_bands(
 def evaluate_current_price(
     current_price: float,
     current_bands: List[float],
+    is_downtrend: bool = False,
 ) -> Dict[str, str]:
     """
     診斷目前股價所在的估值區間。
     current_bands 必須是 5 個升冪排列的帶線價格。
+    is_downtrend：最新收盤 < 60MA 時為 True，觸發價值陷阱警告。
     """
     if len(current_bands) < 5:
         return {}
@@ -615,6 +632,15 @@ def evaluate_current_price(
         zone = 4
 
     icon, label, color, desc = _EVAL_ZONES[zone]
+
+    # 價值陷阱警告：估值便宜但季線走空，可能是基本面衰退而非真便宜
+    if zone in {0, 1} and is_downtrend:
+        desc  = (
+            "⚠️ 價值陷阱警告：股價處於便宜區但季線下彎，"
+            "可能反映基本面衰退，請勿盲目接刀，待技術面築底後再佈局。"
+        )
+        color = "#E65100"
+
     return {
         "zone":        str(zone),
         "label":       label,
@@ -860,7 +886,7 @@ def _render_results(cache: Dict[str, Any]) -> None:
     )
 
     ratio_brief = band_data["ratio_name"].split("（")[0]
-    suffix      = "自訂倍數" if is_custom else "TTM EPS｜5 等份估值帶"
+    suffix      = "自訂倍數" if is_custom else "TTM EPS｜滾動分位估值帶"
     title_str   = (
         f"{resolved}　{ratio_brief}河流圖"
         f"（近 {years} 年｜{suffix}）"
@@ -1059,8 +1085,16 @@ def render_valuation_page() -> None:
                         st.warning(_HINTS.get(method_key, "資料不足，無法計算。"))
                         st.session_state["val_cache"] = None
                     else:
+                        # 季線方向判斷（收盤 < 60MA → 空頭，防範價值陷阱）
+                        _close  = data["price_df"]["close"]
+                        _ma60   = _close.rolling(60).mean().dropna()
+                        _is_downtrend = (
+                            not _ma60.empty
+                            and float(_close.iloc[-1]) < float(_ma60.iloc[-1])
+                        )
                         eval_result = evaluate_current_price(
-                            data["current_price"], band_data["current_bands"]
+                            data["current_price"], band_data["current_bands"],
+                            is_downtrend=_is_downtrend,
                         )
                         st.session_state["val_cache"] = {
                             "data":        data,
