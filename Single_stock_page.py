@@ -940,6 +940,247 @@ def render_ohlcv_chart(
 
 
 # ═════════════════════════════════════════════
+# 演算法層：價值區域（Value Area）計算
+# ═════════════════════════════════════════════
+
+def _compute_value_area(
+    full_vol: List[float],
+    poc_idx: int,
+    bins: int,
+    target_pct: float = 0.70,
+) -> Tuple[int, int]:
+    """
+    依 Volume Profile 標準演算法計算價值區域（Value Area）。
+
+    步驟
+    ----
+    1. target = total_vol × target_pct
+    2. 從 POC 開始，remaining = target - vol[POC]
+    3. 每回合：比較 POC 上方的下一格（upper_ptr）與下方的下一格（lower_ptr）
+       - 選成交量較大的一側加入 VA
+       - 平手規則：選距 POC 較近者；距離相等時選上方
+    4. 若該格成交量 > 剩餘量，停止（VA 完成）
+    5. 更新對應邊界（VAH 或 VAL），對應指標前進一格
+
+    Returns
+    -------
+    (va_low_idx, va_high_idx) — 價值區域最低 / 最高的 bin 索引
+    """
+    total_vol = sum(full_vol)
+    if total_vol <= 0:
+        return poc_idx, poc_idx
+
+    remaining = total_vol * target_pct - full_vol[poc_idx]
+    if remaining <= 0:
+        return poc_idx, poc_idx
+
+    va_low_idx  = poc_idx
+    va_high_idx = poc_idx
+    upper_ptr   = poc_idx + 1
+    lower_ptr   = poc_idx - 1
+
+    while remaining > 0:
+        upper_ok = upper_ptr < bins
+        lower_ok = lower_ptr >= 0
+
+        if not upper_ok and not lower_ok:
+            break
+
+        if upper_ok and lower_ok:
+            uv, lv = full_vol[upper_ptr], full_vol[lower_ptr]
+            if uv == lv:
+                # 平手：距 POC 較近者優先；等距時選上方
+                choose_upper = (upper_ptr - poc_idx) <= (poc_idx - lower_ptr)
+            else:
+                choose_upper = uv > lv
+        else:
+            choose_upper = upper_ok   # 只剩一側可選
+
+        if choose_upper:
+            cv = full_vol[upper_ptr]
+            if cv > remaining:
+                break
+            remaining   -= cv
+            va_high_idx  = upper_ptr
+            upper_ptr   += 1
+        else:
+            cv = full_vol[lower_ptr]
+            if cv > remaining:
+                break
+            remaining  -= cv
+            va_low_idx  = lower_ptr
+            lower_ptr  -= 1
+
+    return va_low_idx, va_high_idx
+
+
+# ═════════════════════════════════════════════
+# 展示層：成交量分佈圖（Volume Profile）
+# ═════════════════════════════════════════════
+
+def render_volume_profile_chart(
+    df: pd.DataFrame,
+    symbol: str,
+    bins: int = 24,
+    va_pct: float = 0.70,
+) -> None:
+    """
+    繪製成交量分佈圖（Volume Profile）並標示價值區域（Value Area）。
+
+    色彩規則
+    --------
+    - POC（最大量格）：橙色
+    - VA 內的格（VAL ~ VAH）：壓力區紅色 / 支撐區綠色（較深）
+    - VA 外的格：同色系但高透明度（20%），用以凸顯 VA
+
+    標註
+    ----
+    - VAH / VAL 格以文字標示
+    - POC 格以文字標示
+    - 最近現價格以藍色文字標示
+
+    Parameters
+    ----------
+    df     : 含 high / low / close / volume 欄位的 DataFrame
+    symbol : 股票代號（用於標題）
+    bins   : 價格區間數量，預設 24 格
+    va_pct : 價值區域涵蓋成交量比例，預設 0.70（70%）
+    """
+    st.subheader(f"📊 {symbol} 成交量分佈（Volume Profile）")
+
+    required = {"close", "volume", "high", "low"}
+    if not required.issubset(df.columns) or df.empty:
+        st.warning("資料缺少必要欄位，無法繪製成交量分佈圖。")
+        return
+
+    df_use = df.dropna(subset=["close", "volume", "high", "low"]).copy()
+    if len(df_use) < 5:
+        st.warning("資料筆數不足（需 5 筆以上），無法計算成交量分佈。")
+        return
+
+    # 以典型價格（HLC/3）作為每根 K 棒的成交重心
+    typical = (df_use["high"] + df_use["low"] + df_use["close"]) / 3
+    price_min, price_max = float(typical.min()), float(typical.max())
+    if price_min >= price_max:
+        st.warning("價格區間過窄，無法計算成交量分佈。")
+        return
+
+    bin_width   = (price_max - price_min) / bins
+    bin_edges   = [price_min + i * bin_width for i in range(bins + 1)]
+    bin_centers = [(bin_edges[i] + bin_edges[i + 1]) / 2 for i in range(bins)]
+
+    bin_idx  = pd.cut(typical, bins=bin_edges, labels=False, include_lowest=True)
+    df_tmp   = pd.DataFrame({"bin": bin_idx, "volume": df_use["volume"].values})
+    vol_agg  = df_tmp.groupby("bin", observed=False)["volume"].sum()
+    full_vol = [float(vol_agg.get(i, 0)) for i in range(bins)]
+
+    poc_idx       = int(max(range(bins), key=lambda i: full_vol[i]))
+    current_close = float(df_use["close"].iloc[-1])
+    max_vol       = max(full_vol) if max(full_vol) > 0 else 1
+
+    # ── 計算價值區域 ────────────────────────────────
+    va_low_idx, va_high_idx = _compute_value_area(full_vol, poc_idx, bins, va_pct)
+    vah_price = bin_centers[va_high_idx]
+    val_price = bin_centers[va_low_idx]
+    poc_price = bin_centers[poc_idx]
+
+    # ── 顏色設定 ─────────────────────────────────────
+    # VA 內：深色（量越大越深）；VA 外：極淺（固定 20%）；POC：橙色
+    bar_colors = []
+    for i, v in enumerate(full_vol):
+        if i == poc_idx:
+            bar_colors.append("#FF9800")
+        elif va_low_idx <= i <= va_high_idx:
+            alpha = 0.50 + 0.45 * (v / max_vol)   # VA 內：50%~95%
+            if bin_centers[i] > current_close:
+                bar_colors.append(f"rgba(239,83,80,{alpha:.2f})")
+            else:
+                bar_colors.append(f"rgba(38,166,154,{alpha:.2f})")
+        else:
+            if bin_centers[i] > current_close:     # VA 外：固定淡色
+                bar_colors.append("rgba(239,83,80,0.18)")
+            else:
+                bar_colors.append("rgba(38,166,154,0.18)")
+
+    y_labels = [f"{c:.2f}" for c in bin_centers]
+
+    fig = go.Figure(go.Bar(
+        x=full_vol,
+        y=y_labels,
+        orientation="h",
+        marker_color=bar_colors,
+        hovertemplate="典型價 %{y}<br>累積量 %{x:,.0f} 張<extra></extra>",
+    ))
+
+    # ── 標註：POC ───────────────────────────────────
+    fig.add_annotation(
+        x=full_vol[poc_idx], y=y_labels[poc_idx],
+        text=f"◀ POC {poc_price:.2f}（{int(full_vol[poc_idx]):,} 張）",
+        showarrow=False, xanchor="left", xshift=6,
+        font=dict(color="#FF9800", size=11),
+    )
+
+    # ── 標註：VAH ───────────────────────────────────
+    if va_high_idx != poc_idx:
+        fig.add_annotation(
+            x=full_vol[va_high_idx], y=y_labels[va_high_idx],
+            text=f"▲ VAH {vah_price:.2f}",
+            showarrow=False, xanchor="left", xshift=6,
+            font=dict(color="#EF5350", size=11),
+        )
+
+    # ── 標註：VAL ───────────────────────────────────
+    if va_low_idx != poc_idx:
+        fig.add_annotation(
+            x=full_vol[va_low_idx], y=y_labels[va_low_idx],
+            text=f"▼ VAL {val_price:.2f}",
+            showarrow=False, xanchor="left", xshift=6,
+            font=dict(color="#26A69A", size=11),
+        )
+
+    # ── 標註：現價最近格 ─────────────────────────────
+    closest = min(range(bins), key=lambda i: abs(bin_centers[i] - current_close))
+    if closest not in {poc_idx, va_high_idx, va_low_idx}:
+        fig.add_annotation(
+            x=full_vol[closest], y=y_labels[closest],
+            text=f"現價 {current_close:.2f} ▶",
+            showarrow=False, xanchor="right", xshift=-6,
+            font=dict(color="#2196F3", size=11),
+        )
+
+    fig.update_layout(
+        height=max(340, bins * 16),
+        xaxis_title="成交量（張）",
+        yaxis_title="價格（TWD）",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+        bargap=0.08,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── 摘要卡片（POC / VAH / VAL / 現價位置）──────────
+    total_vol_sum = sum(full_vol)
+    va_vol_sum    = sum(full_vol[va_low_idx: va_high_idx + 1])
+    actual_pct    = va_vol_sum / total_vol_sum * 100 if total_vol_sum > 0 else 0.0
+
+    in_va = val_price <= current_close <= vah_price
+    price_zone = (
+        f"位於 VA 內（支撐 {val_price:.2f} ~ 壓力 {vah_price:.2f}）" if in_va
+        else (f"高於 VAH {vah_price:.2f}，強勢區" if current_close > vah_price
+              else f"低於 VAL {val_price:.2f}，弱勢區")
+    )
+
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("POC 成本密集區",  f"{poc_price:.2f}")
+    mc2.metric("VAH 價值區上緣",  f"{vah_price:.2f}")
+    mc3.metric("VAL 價值區下緣",  f"{val_price:.2f}")
+    mc4.metric(f"VA 覆蓋量（目標 {va_pct*100:.0f}%）", f"{actual_pct:.1f}%")
+    st.caption(f"現價 {current_close:.2f}：{price_zone}")
+
+
+# ═════════════════════════════════════════════
 # 展示層：頁面渲染函式
 # ═════════════════════════════════════════════
 
@@ -968,14 +1209,15 @@ def render_single_stock_page() -> None:
             help="20日極值：近20日最高/最低絕對極端；N字轉折：5根滾動視窗波段高低點（排除最後2根避免 look-ahead bias）；籌碼密集區：近60日收盤切20格，找累積量最大格的中間值作為大量籌碼區位",
         )
 
-        ind_cols = st.columns(7)
-        show_ma5  = ind_cols[0].checkbox("MA5",           value=True,  key="ss_ma5")
-        show_ma10 = ind_cols[1].checkbox("MA10",          value=True,  key="ss_ma10")
-        show_ma20 = ind_cols[2].checkbox("MA20",          value=True,  key="ss_ma20")
-        show_kd   = ind_cols[3].checkbox("KD",            value=True,  key="ss_kd")
-        show_bb   = ind_cols[4].checkbox("布林",          value=True, key="ss_bb")
-        show_rsi  = ind_cols[5].checkbox("RSI",           value=True, key="ss_rsi")
-        show_macd = ind_cols[6].checkbox("MACD",          value=True, key="ss_macd")
+        ind_cols = st.columns(8)
+        show_ma5  = ind_cols[0].checkbox("MA5",    value=True,  key="ss_ma5")
+        show_ma10 = ind_cols[1].checkbox("MA10",   value=True,  key="ss_ma10")
+        show_ma20 = ind_cols[2].checkbox("MA20",   value=True,  key="ss_ma20")
+        show_kd   = ind_cols[3].checkbox("KD",     value=True,  key="ss_kd")
+        show_bb   = ind_cols[4].checkbox("布林",   value=True,  key="ss_bb")
+        show_rsi  = ind_cols[5].checkbox("RSI",    value=True,  key="ss_rsi")
+        show_macd = ind_cols[6].checkbox("MACD",   value=True,  key="ss_macd")
+        show_vp   = ind_cols[7].checkbox("量分佈", value=False, key="ss_vp")
 
         query_btn = st.button("查詢", type="primary", use_container_width=True)
 
@@ -1260,6 +1502,10 @@ background:#FFF8E1;text-align:center;">
         sup_label=sup_label,
         poc_label=_poc_label,
     )
+    if show_vp:
+        st.markdown("---")
+        render_volume_profile_chart(df, symbol)
+
     render_data_table(df, symbol)
 
     # ── 均線扣抵值模組（使用完整資料集確保季線有效）──
